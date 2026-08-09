@@ -357,6 +357,58 @@ def ensure_sites_lifecycle_schema(
     )
 
 
+def ensure_sites_display_policy_schema(
+    conn: Connection,
+) -> None:
+    """
+    Phase 3 operational headcount display policy.
+
+    Stored on the site because Admin/backend owns the
+    deployment policy. Both permissions default OFF so
+    existing deployments do not expose occupancy merely
+    because the software is upgraded.
+    """
+    display_policy_columns = (
+        (
+            "allow_kiosk_headcount_display",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "allow_physical_headcount_display",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+    )
+
+    for (
+        column_name,
+        column_definition,
+    ) in display_policy_columns:
+        add_column_if_missing(
+            conn,
+            "sites",
+            column_name,
+            column_definition,
+        )
+
+    execute_write(
+        conn,
+        """
+        UPDATE sites
+        SET allow_kiosk_headcount_display = 0
+        WHERE allow_kiosk_headcount_display IS NULL
+        """,
+    )
+
+    execute_write(
+        conn,
+        """
+        UPDATE sites
+        SET allow_physical_headcount_display = 0
+        WHERE allow_physical_headcount_display IS NULL
+        """,
+    )
+
+
 # =========================================================
 # Database Init
 # =========================================================
@@ -383,6 +435,8 @@ def init_db() -> None:
                     latitude REAL,
                     longitude REAL,
                     site_policy_mode TEXT DEFAULT 'standard',
+                    allow_kiosk_headcount_display INTEGER NOT NULL DEFAULT 0,
+                    allow_physical_headcount_display INTEGER NOT NULL DEFAULT 0,
                     operational_state TEXT NOT NULL DEFAULT 'active',
                     archived_at TEXT,
                     unlinked_at TEXT,
@@ -396,6 +450,7 @@ def init_db() -> None:
         )
 
         ensure_sites_lifecycle_schema(conn)
+        ensure_sites_display_policy_schema(conn)
 
         conn.execute(
             text(
@@ -558,6 +613,9 @@ class CreateSiteRequest(BaseModel):
         "strict",
     ] = "standard"
 
+    allow_kiosk_headcount_display: bool = False
+    allow_physical_headcount_display: bool = False
+
 
 class UpdateSiteRequest(BaseModel):
     name: Optional[str] = None
@@ -576,6 +634,9 @@ class UpdateSiteRequest(BaseModel):
             "strict",
         ]
     ] = None
+
+    allow_kiosk_headcount_display: Optional[bool] = None
+    allow_physical_headcount_display: Optional[bool] = None
 
 
 class BindKioskRequest(BaseModel):
@@ -1147,6 +1208,8 @@ def fetch_site_summary(
             s.latitude,
             s.longitude,
             s.site_policy_mode,
+            s.allow_kiosk_headcount_display,
+            s.allow_physical_headcount_display,
             s.operational_state,
             s.archived_at,
             s.unlinked_at,
@@ -1175,6 +1238,13 @@ def fetch_site_summary(
             status_code=404,
             detail="Site not found.",
         )
+
+    row["allow_kiosk_headcount_display"] = bool(
+        row.get("allow_kiosk_headcount_display")
+    )
+    row["allow_physical_headcount_display"] = bool(
+        row.get("allow_physical_headcount_display")
+    )
 
     return row
 
@@ -1374,6 +1444,8 @@ async def admin_create_site(
                 latitude,
                 longitude,
                 site_policy_mode,
+                allow_kiosk_headcount_display,
+                allow_physical_headcount_display,
                 created_at,
                 updated_at
             )
@@ -1387,6 +1459,8 @@ async def admin_create_site(
                 :latitude,
                 :longitude,
                 :site_policy_mode,
+                :allow_kiosk_headcount_display,
+                :allow_physical_headcount_display,
                 :created_at,
                 :updated_at
             )
@@ -1406,6 +1480,10 @@ async def admin_create_site(
                     payload.longitude,
                 "site_policy_mode":
                     payload.site_policy_mode,
+                "allow_kiosk_headcount_display":
+                    1 if payload.allow_kiosk_headcount_display else 0,
+                "allow_physical_headcount_display":
+                    1 if payload.allow_physical_headcount_display else 0,
                 "created_at": now,
                 "updated_at": now,
             },
@@ -1438,6 +1516,8 @@ async def admin_list_sites():
                 s.latitude,
                 s.longitude,
                 s.site_policy_mode,
+                s.allow_kiosk_headcount_display,
+                s.allow_physical_headcount_display,
                 s.operational_state,
                 s.archived_at,
                 s.unlinked_at,
@@ -1467,6 +1547,22 @@ async def admin_list_sites():
         results = []
 
         for site in rows:
+            site[
+                "allow_kiosk_headcount_display"
+            ] = bool(
+                site.get(
+                    "allow_kiosk_headcount_display"
+                )
+            )
+
+            site[
+                "allow_physical_headcount_display"
+            ] = bool(
+                site.get(
+                    "allow_physical_headcount_display"
+                )
+            )
+
             site[
                 "in_active_crisis_area"
             ] = site_in_any_active_crisis(
@@ -1586,6 +1682,10 @@ async def admin_update_site(
                     longitude = :longitude,
                     site_policy_mode =
                         :site_policy_mode,
+                    allow_kiosk_headcount_display =
+                        :allow_kiosk_headcount_display,
+                    allow_physical_headcount_display =
+                        :allow_physical_headcount_display,
                     updated_at = :updated_at
                 WHERE site_id = :site_id
                   AND operational_state =
@@ -1617,6 +1717,14 @@ async def admin_update_site(
                         merged.get(
                             "site_policy_mode"
                         ),
+                    "allow_kiosk_headcount_display":
+                        1 if merged.get(
+                            "allow_kiosk_headcount_display"
+                        ) else 0,
+                    "allow_physical_headcount_display":
+                        1 if merged.get(
+                            "allow_physical_headcount_display"
+                        ) else 0,
                     "updated_at":
                         merged["updated_at"],
                     "site_id": site_id,
@@ -1652,6 +1760,10 @@ async def admin_update_site(
                     longitude = :longitude,
                     site_policy_mode =
                         :site_policy_mode,
+                    allow_kiosk_headcount_display =
+                        :allow_kiosk_headcount_display,
+                    allow_physical_headcount_display =
+                        :allow_physical_headcount_display,
                     updated_at = :updated_at
                 WHERE site_id = :site_id
                 """,
@@ -1680,6 +1792,14 @@ async def admin_update_site(
                         merged.get(
                             "site_policy_mode"
                         ),
+                    "allow_kiosk_headcount_display":
+                        1 if merged.get(
+                            "allow_kiosk_headcount_display"
+                        ) else 0,
+                    "allow_physical_headcount_display":
+                        1 if merged.get(
+                            "allow_physical_headcount_display"
+                        ) else 0,
                     "updated_at":
                         merged["updated_at"],
                     "site_id": site_id,
@@ -2508,6 +2628,10 @@ async def kiosk_bootstrap(
                 "bound": False,
                 "site": None,
                 "status": None,
+                "permissions": {
+                    "allow_kiosk_headcount_display": False,
+                    "allow_physical_headcount_display": False,
+                },
                 "ncm_state": None,
                 "in_active_crisis_area":
                     False,
@@ -2590,6 +2714,20 @@ async def kiosk_bootstrap(
                 "last_event_at":
                     site.get(
                         "last_event_at"
+                    ),
+            },
+            "permissions": {
+                "allow_kiosk_headcount_display":
+                    bool(
+                        site.get(
+                            "allow_kiosk_headcount_display"
+                        )
+                    ),
+                "allow_physical_headcount_display":
+                    bool(
+                        site.get(
+                            "allow_physical_headcount_display"
+                        )
                     ),
             },
             "ncm_state":
