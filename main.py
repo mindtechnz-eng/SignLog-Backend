@@ -155,6 +155,16 @@ def normalise_sign_action(
     )
 
 
+def normalise_event_source(
+    value: Optional[str],
+) -> str:
+    cleaned = (
+        value or ""
+    ).strip()
+
+    return cleaned or "kiosk"
+
+
 def json_dumps(data: Any) -> str:
     return json.dumps(
         data or {},
@@ -592,6 +602,7 @@ class SignEventRequest(BaseModel):
 
     type: str
     timestamp: Optional[str] = None
+    source: Optional[str] = None
 
 
 class HazardEventRequest(BaseModel):
@@ -611,6 +622,7 @@ class HazardEventRequest(BaseModel):
     ] = "medium"
 
     timestamp: Optional[str] = None
+    source: Optional[str] = None
 
 
 class IncidentEventRequest(BaseModel):
@@ -626,6 +638,7 @@ class IncidentEventRequest(BaseModel):
     injury: bool = False
 
     timestamp: Optional[str] = None
+    source: Optional[str] = None
 
 
 class SOSEventRequest(BaseModel):
@@ -635,6 +648,7 @@ class SOSEventRequest(BaseModel):
 
     timestamp: Optional[str] = None
     note: Optional[str] = None
+    source: Optional[str] = None
 
 
 class FullHeadcountEventRequest(BaseModel):
@@ -644,6 +658,7 @@ class FullHeadcountEventRequest(BaseModel):
 
     timestamp: Optional[str] = None
     note: Optional[str] = None
+    source: Optional[str] = None
 
 
 class CreateCrisisRequest(BaseModel):
@@ -1217,6 +1232,56 @@ def site_in_any_active_crisis(
             return True
 
     return False
+
+
+def classify_ncm_site_state(
+    site: Dict[str, Any],
+    crises: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Shared NZ-NCM classification for every backend read
+    surface that needs crisis interpretation.
+
+    This preserves one red / orange / green law for both
+    the NZ-NCM feed and the kiosk bootstrap contract.
+    """
+    in_crisis_area = site_in_any_active_crisis(
+        site,
+        crises,
+    )
+
+    ncm_state = None
+    priority = None
+
+    if site.get("sos_active"):
+        ncm_state = "red"
+        priority = 1
+
+    elif (
+        in_crisis_area
+        and site.get(
+            "active_count",
+            0,
+        ) > 0
+        and not site.get(
+            "full_headcount_confirmed"
+        )
+    ):
+        ncm_state = "orange"
+        priority = 2
+
+    elif site.get(
+        "full_headcount_confirmed"
+    ):
+        ncm_state = "green"
+        priority = 3
+
+    return {
+        "ncm_state": ncm_state,
+        "priority": priority,
+        "in_active_crisis_area":
+            in_crisis_area,
+    }
 
 
 # =========================================================
@@ -2370,53 +2435,19 @@ async def ncm_sites():
         )
 
         for site in rows:
-            in_crisis_area = (
-                site_in_any_active_crisis(
+            classification = (
+                classify_ncm_site_state(
                     site,
                     crises,
                 )
             )
 
-            ncm_state = None
-            priority = None
-
-            if site.get(
-                "sos_active"
+            if classification.get(
+                "ncm_state"
             ):
-                ncm_state = "red"
-                priority = 1
-
-            elif (
-                in_crisis_area
-                and site.get(
-                    "active_count",
-                    0,
-                ) > 0
-                and not site.get(
-                    "full_headcount_confirmed"
+                site.update(
+                    classification
                 )
-            ):
-                ncm_state = "orange"
-                priority = 2
-
-            elif site.get(
-                "full_headcount_confirmed"
-            ):
-                ncm_state = "green"
-                priority = 3
-
-            if ncm_state:
-                site[
-                    "ncm_state"
-                ] = ncm_state
-
-                site[
-                    "priority"
-                ] = priority
-
-                site[
-                    "in_active_crisis_area"
-                ] = in_crisis_area
 
                 sites.append(site)
 
@@ -2439,6 +2470,140 @@ async def ncm_sites():
 # =========================================================
 # Kiosk API
 # =========================================================
+
+@app.get("/kiosk/bootstrap/{kiosk_id}")
+async def kiosk_bootstrap(
+    kiosk_id: str,
+):
+    cleaned_kiosk_id = (
+        kiosk_id or ""
+    ).strip()
+
+    if not cleaned_kiosk_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid kiosk_id.",
+        )
+
+    with get_db() as conn:
+        binding = fetch_one(
+            conn,
+            """
+            SELECT site_id
+            FROM sites
+            WHERE kiosk_id = :kiosk_id
+              AND operational_state =
+                    'active'
+            """,
+            {
+                "kiosk_id":
+                    cleaned_kiosk_id,
+            },
+        )
+
+        if not binding:
+            return {
+                "kiosk_id":
+                    cleaned_kiosk_id,
+                "bound": False,
+                "site": None,
+                "status": None,
+                "ncm_state": None,
+                "in_active_crisis_area":
+                    False,
+            }
+
+        site_id = binding[
+            "site_id"
+        ]
+
+        ensure_site_status(
+            conn,
+            site_id,
+        )
+
+        site = fetch_site_summary(
+            conn,
+            site_id,
+        )
+
+        crises = list_active_crises(
+            conn
+        )
+
+        classification = (
+            classify_ncm_site_state(
+                site,
+                crises,
+            )
+        )
+
+        return {
+            "kiosk_id":
+                cleaned_kiosk_id,
+            "bound": True,
+            "site": {
+                "site_id":
+                    site["site_id"],
+                "name":
+                    site["name"],
+                "site_policy_mode":
+                    site.get(
+                        "site_policy_mode"
+                    )
+                    or "standard",
+                "operational_state":
+                    site.get(
+                        "operational_state"
+                    )
+                    or "active",
+            },
+            "status": {
+                "status":
+                    site.get(
+                        "status"
+                    )
+                    or "idle",
+                "active_count":
+                    int(
+                        site.get(
+                            "active_count"
+                        )
+                        or 0
+                    ),
+                "headcount_status":
+                    site.get(
+                        "headcount_status"
+                    )
+                    or "pending",
+                "sos_active": bool(
+                    site.get(
+                        "sos_active"
+                    )
+                ),
+                "full_headcount_confirmed":
+                    bool(
+                        site.get(
+                            "full_headcount_confirmed"
+                        )
+                    ),
+                "last_event_at":
+                    site.get(
+                        "last_event_at"
+                    ),
+            },
+            "ncm_state":
+                classification.get(
+                    "ncm_state"
+                ),
+            "in_active_crisis_area":
+                bool(
+                    classification.get(
+                        "in_active_crisis_area"
+                    )
+                ),
+        }
+
 
 @app.post("/api/signin")
 async def api_signin(
@@ -2484,6 +2649,10 @@ async def api_signin(
                 payload.role,
             "action":
                 sign_event_type,
+            "source":
+                normalise_event_source(
+                    payload.source
+                ),
         }
 
         event_id = insert_event(
@@ -2536,6 +2705,10 @@ async def api_hazard(
                 payload.description,
             "severity":
                 payload.severity,
+            "source":
+                normalise_event_source(
+                    payload.source
+                ),
         }
 
         event_id = insert_event(
@@ -2587,6 +2760,10 @@ async def api_incident(
                 payload.description,
             "injury":
                 payload.injury,
+            "source":
+                normalise_event_source(
+                    payload.source
+                ),
         }
 
         event_id = insert_event(
@@ -2639,6 +2816,10 @@ async def api_sos(
                 occurred_at,
             payload={
                 "note": payload.note,
+                "source":
+                    normalise_event_source(
+                        payload.source
+                    ),
             },
         )
 
@@ -2681,6 +2862,10 @@ async def api_full_headcount(
                 occurred_at,
             payload={
                 "note": payload.note,
+                "source":
+                    normalise_event_source(
+                        payload.source
+                    ),
             },
         )
 
