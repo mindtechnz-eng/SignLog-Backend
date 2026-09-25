@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import json
@@ -6,6 +7,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from math import radians, sin, cos, sqrt, atan2
 from typing import Any, Dict, List, Literal, Optional
+from uuid import uuid4
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
@@ -153,16 +155,6 @@ def normalise_sign_action(
             "Use in/out or signin/signout."
         ),
     )
-
-
-def normalise_event_source(
-    value: Optional[str],
-) -> str:
-    cleaned = (
-        value or ""
-    ).strip()
-
-    return cleaned or "kiosk"
 
 
 def json_dumps(data: Any) -> str:
@@ -357,54 +349,110 @@ def ensure_sites_lifecycle_schema(
     )
 
 
-def ensure_sites_display_policy_schema(
+# =========================================================
+# H&I - Schema Init (HI.1)
+# =========================================================
+
+def ensure_site_hi_schema(
     conn: Connection,
 ) -> None:
     """
-    Phase 3 operational headcount display policy.
+    Create the Site Hazards & Information persistence
+    foundation without changing existing SignLog domains.
 
-    Stored on the site because Admin/backend owns the
-    deployment policy. Both permissions default OFF so
-    existing deployments do not expose occupancy merely
-    because the software is upgraded.
+    HI.1 creates both the fast current projection and the
+    immutable action-history table. Material action writes do
+    not begin until HI.2.
     """
-    display_policy_columns = (
-        (
-            "allow_kiosk_headcount_display",
-            "INTEGER NOT NULL DEFAULT 0",
-        ),
-        (
-            "allow_physical_headcount_display",
-            "INTEGER NOT NULL DEFAULT 0",
-        ),
+    execute_write(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS site_hi_state (
+            site_id TEXT PRIMARY KEY,
+            revision INTEGER NOT NULL DEFAULT 0,
+            content_json TEXT NOT NULL,
+            published_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(site_id)
+                REFERENCES sites(site_id)
+        )
+        """,
     )
 
-    for (
-        column_name,
-        column_definition,
-    ) in display_policy_columns:
-        add_column_if_missing(
+    if DB_MODE == "postgres":
+        execute_write(
             conn,
-            "sites",
-            column_name,
-            column_definition,
+            """
+            CREATE TABLE IF NOT EXISTS site_hi_actions (
+                id SERIAL PRIMARY KEY,
+                site_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                action_type TEXT NOT NULL,
+                item_id TEXT,
+                actor_type TEXT NOT NULL,
+                actor_ref TEXT,
+                source_type TEXT NOT NULL,
+                evidence_event_ids_json TEXT,
+                action_payload_json TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                FOREIGN KEY(site_id)
+                    REFERENCES sites(site_id)
+            )
+            """,
+        )
+    else:
+        execute_write(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS site_hi_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                site_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                action_type TEXT NOT NULL,
+                item_id TEXT,
+                actor_type TEXT NOT NULL,
+                actor_ref TEXT,
+                source_type TEXT NOT NULL,
+                evidence_event_ids_json TEXT,
+                action_payload_json TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                FOREIGN KEY(site_id)
+                    REFERENCES sites(site_id)
+            )
+            """,
         )
 
     execute_write(
         conn,
         """
-        UPDATE sites
-        SET allow_kiosk_headcount_display = 0
-        WHERE allow_kiosk_headcount_display IS NULL
+        CREATE UNIQUE INDEX IF NOT EXISTS
+            uq_site_hi_actions_site_revision
+        ON site_hi_actions(site_id, revision)
         """,
     )
 
     execute_write(
         conn,
         """
-        UPDATE sites
-        SET allow_physical_headcount_display = 0
-        WHERE allow_physical_headcount_display IS NULL
+        CREATE INDEX IF NOT EXISTS
+            idx_site_hi_actions_site_id
+        ON site_hi_actions(site_id)
+        """,
+    )
+
+    execute_write(
+        conn,
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_site_hi_actions_site_time_id
+        ON site_hi_actions(
+            site_id,
+            occurred_at,
+            id
+        )
         """,
     )
 
@@ -435,8 +483,6 @@ def init_db() -> None:
                     latitude REAL,
                     longitude REAL,
                     site_policy_mode TEXT DEFAULT 'standard',
-                    allow_kiosk_headcount_display INTEGER NOT NULL DEFAULT 0,
-                    allow_physical_headcount_display INTEGER NOT NULL DEFAULT 0,
                     operational_state TEXT NOT NULL DEFAULT 'active',
                     archived_at TEXT,
                     unlinked_at TEXT,
@@ -450,7 +496,7 @@ def init_db() -> None:
         )
 
         ensure_sites_lifecycle_schema(conn)
-        ensure_sites_display_policy_schema(conn)
+        ensure_site_hi_schema(conn)
 
         conn.execute(
             text(
@@ -613,9 +659,6 @@ class CreateSiteRequest(BaseModel):
         "strict",
     ] = "standard"
 
-    allow_kiosk_headcount_display: bool = False
-    allow_physical_headcount_display: bool = False
-
 
 class UpdateSiteRequest(BaseModel):
     name: Optional[str] = None
@@ -634,9 +677,6 @@ class UpdateSiteRequest(BaseModel):
             "strict",
         ]
     ] = None
-
-    allow_kiosk_headcount_display: Optional[bool] = None
-    allow_physical_headcount_display: Optional[bool] = None
 
 
 class BindKioskRequest(BaseModel):
@@ -663,7 +703,6 @@ class SignEventRequest(BaseModel):
 
     type: str
     timestamp: Optional[str] = None
-    source: Optional[str] = None
 
 
 class HazardEventRequest(BaseModel):
@@ -683,7 +722,6 @@ class HazardEventRequest(BaseModel):
     ] = "medium"
 
     timestamp: Optional[str] = None
-    source: Optional[str] = None
 
 
 class IncidentEventRequest(BaseModel):
@@ -699,7 +737,6 @@ class IncidentEventRequest(BaseModel):
     injury: bool = False
 
     timestamp: Optional[str] = None
-    source: Optional[str] = None
 
 
 class SOSEventRequest(BaseModel):
@@ -709,7 +746,6 @@ class SOSEventRequest(BaseModel):
 
     timestamp: Optional[str] = None
     note: Optional[str] = None
-    source: Optional[str] = None
 
 
 class FullHeadcountEventRequest(BaseModel):
@@ -719,7 +755,6 @@ class FullHeadcountEventRequest(BaseModel):
 
     timestamp: Optional[str] = None
     note: Optional[str] = None
-    source: Optional[str] = None
 
 
 class CreateCrisisRequest(BaseModel):
@@ -745,6 +780,50 @@ class CreateCrisisRequest(BaseModel):
     center_longitude: float
 
     radius_km: float = Field(gt=0)
+
+
+# =========================================================
+# H&I Mutation Models (HI.2)
+# =========================================================
+
+class SiteHiItemMutationRequest(BaseModel):
+    expected_revision: int = Field(ge=0)
+
+    category: Literal[
+        "current_hazard",
+        "temporary_update",
+        "site_information",
+    ]
+
+    title: str = Field(
+        min_length=1,
+        max_length=120,
+    )
+    message: str = Field(
+        min_length=1,
+        max_length=1500,
+    )
+
+    display_order: int = Field(
+        ge=0,
+        le=999,
+    )
+
+    valid_until: Optional[str] = None
+    evidence_event_ids: Optional[List[int]] = None
+
+
+class SiteHiClearRequest(BaseModel):
+    expected_revision: int = Field(ge=0)
+
+    # HI.2 correspondence correction:
+    # clearing active field communication is a material action,
+    # so a short reason is required even though it does NOT mean
+    # the underlying hazard/evidence has been resolved.
+    reason: str = Field(
+        min_length=1,
+        max_length=500,
+    )
 
 
 # =========================================================
@@ -1208,8 +1287,6 @@ def fetch_site_summary(
             s.latitude,
             s.longitude,
             s.site_policy_mode,
-            s.allow_kiosk_headcount_display,
-            s.allow_physical_headcount_display,
             s.operational_state,
             s.archived_at,
             s.unlinked_at,
@@ -1238,13 +1315,6 @@ def fetch_site_summary(
             status_code=404,
             detail="Site not found.",
         )
-
-    row["allow_kiosk_headcount_display"] = bool(
-        row.get("allow_kiosk_headcount_display")
-    )
-    row["allow_physical_headcount_display"] = bool(
-        row.get("allow_physical_headcount_display")
-    )
 
     return row
 
@@ -1304,54 +1374,1320 @@ def site_in_any_active_crisis(
     return False
 
 
-def classify_ncm_site_state(
-    site: Dict[str, Any],
-    crises: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """
-    Shared NZ-NCM classification for every backend read
-    surface that needs crisis interpretation.
+# =========================================================
+# H&I - Authoritative Domain Helpers (HI.1 + HI.2)
+# =========================================================
 
-    This preserves one red / orange / green law for both
-    the NZ-NCM feed and the kiosk bootstrap contract.
-    """
-    in_crisis_area = site_in_any_active_crisis(
-        site,
-        crises,
+HI_CATEGORY_ORDER = {
+    "current_hazard": 0,
+    "temporary_update": 1,
+    "site_information": 2,
+}
+
+HI_ITEM_SOURCE_TYPES = {
+    "manual_operator",
+    "evidence_linked",
+}
+
+HI_ACTION_TYPES = {
+    "publish_item",
+    "edit_item",
+    "clear_item",
+    "expire_items",
+}
+
+HI_ACTION_ACTOR_TYPES = {
+    "admin_operator",
+    "system",
+}
+
+HI_ACTION_SOURCE_TYPES = {
+    "manual_operator",
+    "evidence_linked",
+    "system_expiry",
+}
+
+
+def require_hi_site(
+    conn: Connection,
+    site_id: str,
+) -> Dict[str, Any]:
+    site = fetch_one(
+        conn,
+        """
+        SELECT
+            site_id,
+            operational_state,
+            kiosk_id
+        FROM sites
+        WHERE site_id = :site_id
+        """,
+        {
+            "site_id": site_id,
+        },
     )
 
-    ncm_state = None
-    priority = None
-
-    if site.get("sos_active"):
-        ncm_state = "red"
-        priority = 1
-
-    elif (
-        in_crisis_area
-        and site.get(
-            "active_count",
-            0,
-        ) > 0
-        and not site.get(
-            "full_headcount_confirmed"
+    if not site:
+        raise HTTPException(
+            status_code=404,
+            detail="Site not found.",
         )
-    ):
-        ncm_state = "orange"
-        priority = 2
 
-    elif site.get(
-        "full_headcount_confirmed"
+    return site
+
+
+def require_hi_mutation_site(
+    conn: Connection,
+    site_id: str,
+) -> Dict[str, Any]:
+    site = require_hi_site(
+        conn,
+        site_id,
+    )
+
+    if (
+        site.get("operational_state")
+        != "active"
     ):
-        ncm_state = "green"
-        priority = 3
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Archived Site H&I is read-only. "
+                "Restore the Site before publishing "
+                "or changing H&I."
+            ),
+        )
+
+    return site
+
+
+def empty_site_hi_snapshot(
+    site_id: str,
+) -> Dict[str, Any]:
+    return {
+        "site_id": site_id,
+        "revision": 0,
+        "published_at": None,
+        "items": [],
+    }
+
+
+def hi_integrity_error(
+    site_id: str,
+    reason: str,
+) -> HTTPException:
+    return HTTPException(
+        status_code=500,
+        detail=(
+            "H&I storage integrity error for "
+            f"Site {site_id}: {reason}"
+        ),
+    )
+
+
+def hi_json_dumps(
+    value: Any,
+) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def parse_hi_datetime(
+    value: Any,
+    *,
+    field_name: str,
+    site_id: Optional[str] = None,
+    storage: bool = False,
+) -> datetime:
+    if not isinstance(value, str):
+        if storage and site_id:
+            raise hi_integrity_error(
+                site_id,
+                f"{field_name} is not a timestamp string.",
+            )
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {field_name} timestamp.",
+        )
+
+    cleaned = value.strip()
+
+    if not cleaned:
+        if storage and site_id:
+            raise hi_integrity_error(
+                site_id,
+                f"{field_name} is empty.",
+            )
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {field_name} timestamp.",
+        )
+
+    try:
+        parsed = datetime.fromisoformat(
+            cleaned.replace("Z", "+00:00")
+        )
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(
+                tzinfo=timezone.utc
+            )
+
+        return parsed.astimezone(
+            timezone.utc
+        )
+
+    except Exception as error:
+        if storage and site_id:
+            raise hi_integrity_error(
+                site_id,
+                f"{field_name} is not valid ISO time.",
+            ) from error
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid {field_name}. "
+                "Provide a valid ISO timestamp."
+            ),
+        ) from error
+
+
+def canonical_hi_items(
+    items: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    return sorted(
+        items,
+        key=lambda item: (
+            HI_CATEGORY_ORDER[
+                item["category"]
+            ],
+            item["display_order"],
+            str(item.get("title") or ""),
+            str(item.get("item_id") or ""),
+        ),
+    )
+
+
+def validate_stored_hi_item(
+    site_id: str,
+    item: Dict[str, Any],
+) -> None:
+    item_id = item.get("item_id")
+    category = item.get("category")
+    title = item.get("title")
+    message = item.get("message")
+    display_order = item.get("display_order")
+    source_type = item.get("source_type")
+    evidence_event_ids = item.get(
+        "evidence_event_ids"
+    )
+
+    if (
+        not isinstance(item_id, str)
+        or not item_id.strip()
+        or not item_id.startswith("hi-")
+    ):
+        raise hi_integrity_error(
+            site_id,
+            "stored item has an invalid item_id.",
+        )
+
+    if category not in HI_CATEGORY_ORDER:
+        raise hi_integrity_error(
+            site_id,
+            "stored item has an unknown category.",
+        )
+
+    if (
+        not isinstance(title, str)
+        or not title.strip()
+        or len(title) > 120
+    ):
+        raise hi_integrity_error(
+            site_id,
+            "stored item has an invalid title.",
+        )
+
+    if (
+        not isinstance(message, str)
+        or not message.strip()
+        or len(message) > 1500
+    ):
+        raise hi_integrity_error(
+            site_id,
+            "stored item has an invalid message.",
+        )
+
+    if (
+        not isinstance(display_order, int)
+        or isinstance(display_order, bool)
+        or display_order < 0
+        or display_order > 999
+    ):
+        raise hi_integrity_error(
+            site_id,
+            "stored item has an invalid display_order.",
+        )
+
+    if source_type not in HI_ITEM_SOURCE_TYPES:
+        raise hi_integrity_error(
+            site_id,
+            "stored item has an invalid source_type.",
+        )
+
+    if not isinstance(evidence_event_ids, list):
+        raise hi_integrity_error(
+            site_id,
+            "stored item evidence_event_ids must be an array.",
+        )
+
+    if len(evidence_event_ids) > 50:
+        raise hi_integrity_error(
+            site_id,
+            "stored item has too many evidence references.",
+        )
+
+    seen_ids = set()
+
+    for event_id in evidence_event_ids:
+        if (
+            not isinstance(event_id, int)
+            or isinstance(event_id, bool)
+            or event_id < 1
+            or event_id in seen_ids
+        ):
+            raise hi_integrity_error(
+                site_id,
+                "stored item has invalid or duplicate evidence IDs.",
+            )
+        seen_ids.add(event_id)
+
+    for field_name in (
+        "valid_from",
+        "created_at",
+        "updated_at",
+    ):
+        parse_hi_datetime(
+            item.get(field_name),
+            field_name=field_name,
+            site_id=site_id,
+            storage=True,
+        )
+
+    valid_until = item.get("valid_until")
+
+    if valid_until is not None:
+        parse_hi_datetime(
+            valid_until,
+            field_name="valid_until",
+            site_id=site_id,
+            storage=True,
+        )
+
+    if (
+        category == "temporary_update"
+        and valid_until is None
+    ):
+        raise hi_integrity_error(
+            site_id,
+            "stored temporary update is missing valid_until.",
+        )
+
+
+def parse_site_hi_content(
+    site_id: str,
+    value: Optional[str],
+) -> List[Dict[str, Any]]:
+    """
+    H&I current-state JSON is authority-bearing data.
+    Malformed H&I storage must never be silently coerced into
+    an empty state.
+    """
+    if value is None:
+        raise hi_integrity_error(
+            site_id,
+            "content_json is missing.",
+        )
+
+    try:
+        decoded = json.loads(value)
+    except Exception as error:
+        raise hi_integrity_error(
+            site_id,
+            "content_json is not valid JSON.",
+        ) from error
+
+    if not isinstance(decoded, dict):
+        raise hi_integrity_error(
+            site_id,
+            "content_json must contain an object.",
+        )
+
+    items = decoded.get("items")
+
+    if not isinstance(items, list):
+        raise hi_integrity_error(
+            site_id,
+            "content_json.items must be an array.",
+        )
+
+    for item in items:
+        if not isinstance(item, dict):
+            raise hi_integrity_error(
+                site_id,
+                "every H&I item must be an object.",
+            )
+
+        validate_stored_hi_item(
+            site_id,
+            item,
+        )
+
+    return canonical_hi_items(
+        items
+    )
+
+
+def load_site_hi_snapshot_raw(
+    conn: Connection,
+    site_id: str,
+) -> Dict[str, Any]:
+    row = fetch_one(
+        conn,
+        """
+        SELECT
+            site_id,
+            revision,
+            content_json,
+            published_at,
+            created_at,
+            updated_at
+        FROM site_hi_state
+        WHERE site_id = :site_id
+        """,
+        {
+            "site_id": site_id,
+        },
+    )
+
+    if not row:
+        return empty_site_hi_snapshot(
+            site_id
+        )
+
+    revision = row.get("revision")
+
+    if (
+        not isinstance(revision, int)
+        or isinstance(revision, bool)
+        or revision < 0
+    ):
+        raise hi_integrity_error(
+            site_id,
+            "revision is invalid.",
+        )
+
+    items = parse_site_hi_content(
+        site_id,
+        row.get("content_json"),
+    )
+
+    published_at = row.get(
+        "published_at"
+    )
+
+    if revision == 0:
+        if published_at is not None:
+            raise hi_integrity_error(
+                site_id,
+                "revision 0 cannot have published_at.",
+            )
+    else:
+        parse_hi_datetime(
+            published_at,
+            field_name="published_at",
+            site_id=site_id,
+            storage=True,
+        )
 
     return {
-        "ncm_state": ncm_state,
-        "priority": priority,
-        "in_active_crisis_area":
-            in_crisis_area,
+        "site_id": site_id,
+        "revision": revision,
+        "published_at": published_at,
+        "items": items,
     }
+
+
+def normalise_hi_evidence_ids(
+    values: Optional[List[int]],
+) -> List[int]:
+    if values is None:
+        return []
+
+    if len(values) > 50:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "H&I evidence_event_ids may contain "
+                "at most 50 event IDs."
+            ),
+        )
+
+    result: List[int] = []
+    seen = set()
+
+    for value in values:
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 1
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "H&I evidence_event_ids must contain "
+                    "positive event IDs."
+                ),
+            )
+
+        if value in seen:
+            continue
+
+        seen.add(value)
+        result.append(value)
+
+    return result
+
+
+def validate_hi_evidence_refs(
+    conn: Connection,
+    site_id: str,
+    event_ids: List[int],
+) -> None:
+    for event_id in event_ids:
+        event = fetch_one(
+            conn,
+            """
+            SELECT id, site_id
+            FROM events
+            WHERE id = :event_id
+            """,
+            {
+                "event_id": event_id,
+            },
+        )
+
+        if not event:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "H&I evidence reference "
+                    f"{event_id} does not exist."
+                ),
+            )
+
+        if event.get("site_id") != site_id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "H&I evidence reference "
+                    f"{event_id} does not belong to "
+                    f"Site {site_id}."
+                ),
+            )
+
+
+def build_hi_item_from_payload(
+    conn: Connection,
+    site_id: str,
+    payload: SiteHiItemMutationRequest,
+    *,
+    existing: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    title = payload.title.strip()
+    message = payload.message.strip()
+
+    if not title:
+        raise HTTPException(
+            status_code=400,
+            detail="H&I title cannot be blank.",
+        )
+
+    if not message:
+        raise HTTPException(
+            status_code=400,
+            detail="H&I message cannot be blank.",
+        )
+
+    now_dt = datetime.now(
+        timezone.utc
+    )
+    now = now_dt.isoformat()
+
+    valid_until: Optional[str] = None
+
+    if payload.valid_until is not None:
+        parsed_until = parse_hi_datetime(
+            payload.valid_until,
+            field_name="valid_until",
+        )
+
+        if parsed_until <= now_dt:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "H&I valid_until must be later "
+                    "than Backend publication time."
+                ),
+            )
+
+        valid_until = parsed_until.isoformat()
+
+    if (
+        payload.category == "temporary_update"
+        and valid_until is None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Temporary Site Update requires "
+                "valid_until."
+            ),
+        )
+
+    evidence_event_ids = (
+        normalise_hi_evidence_ids(
+            payload.evidence_event_ids
+        )
+    )
+
+    validate_hi_evidence_refs(
+        conn,
+        site_id,
+        evidence_event_ids,
+    )
+
+    source_type = (
+        "evidence_linked"
+        if evidence_event_ids
+        else "manual_operator"
+    )
+
+    item_id = (
+        existing["item_id"]
+        if existing
+        else f"hi-{uuid4()}"
+    )
+
+    created_at = (
+        existing["created_at"]
+        if existing
+        else now
+    )
+
+    # An edit is a republished current version. created_at keeps
+    # original identity; valid_from records when this version
+    # became effective.
+    item = {
+        "item_id": item_id,
+        "category": payload.category,
+        "title": title,
+        "message": message,
+        "display_order": payload.display_order,
+        "valid_from": now,
+        "valid_until": valid_until,
+        "source_type": source_type,
+        "evidence_event_ids":
+            evidence_event_ids,
+        "created_at": created_at,
+        "updated_at": now,
+    }
+
+    if existing:
+        comparable_fields = (
+            "category",
+            "title",
+            "message",
+            "display_order",
+            "valid_until",
+            "source_type",
+            "evidence_event_ids",
+        )
+
+        if all(
+            existing.get(field_name)
+            == item.get(field_name)
+            for field_name in comparable_fields
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "H&I edit contains no material change."
+                ),
+            )
+
+    return item
+
+
+def require_expected_hi_revision(
+    snapshot: Dict[str, Any],
+    expected_revision: int,
+) -> None:
+    if snapshot["revision"] != expected_revision:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "H&I revision conflict. Refresh current "
+                "Site H&I and retry."
+            ),
+        )
+
+
+def find_current_hi_item(
+    snapshot: Dict[str, Any],
+    item_id: str,
+) -> Dict[str, Any]:
+    for item in snapshot["items"]:
+        if item.get("item_id") == item_id:
+            return item
+
+    raise HTTPException(
+        status_code=404,
+        detail=(
+            "H&I item is not present in the current "
+            "Site projection."
+        ),
+    )
+
+
+def insert_site_hi_action(
+    conn: Connection,
+    *,
+    site_id: str,
+    revision: int,
+    action_type: str,
+    item_id: Optional[str],
+    actor_type: str,
+    actor_ref: Optional[str],
+    source_type: str,
+    evidence_event_ids: List[int],
+    action_payload: Dict[str, Any],
+    snapshot: Dict[str, Any],
+    occurred_at: str,
+) -> None:
+    if action_type not in HI_ACTION_TYPES:
+        raise ValueError(
+            "Invalid internal H&I action_type."
+        )
+
+    if actor_type not in HI_ACTION_ACTOR_TYPES:
+        raise ValueError(
+            "Invalid internal H&I actor_type."
+        )
+
+    if source_type not in HI_ACTION_SOURCE_TYPES:
+        raise ValueError(
+            "Invalid internal H&I source_type."
+        )
+
+    execute_write(
+        conn,
+        """
+        INSERT INTO site_hi_actions (
+            site_id,
+            revision,
+            action_type,
+            item_id,
+            actor_type,
+            actor_ref,
+            source_type,
+            evidence_event_ids_json,
+            action_payload_json,
+            snapshot_json,
+            occurred_at
+        )
+        VALUES (
+            :site_id,
+            :revision,
+            :action_type,
+            :item_id,
+            :actor_type,
+            :actor_ref,
+            :source_type,
+            :evidence_event_ids_json,
+            :action_payload_json,
+            :snapshot_json,
+            :occurred_at
+        )
+        """,
+        {
+            "site_id": site_id,
+            "revision": revision,
+            "action_type": action_type,
+            "item_id": item_id,
+            "actor_type": actor_type,
+            "actor_ref": actor_ref,
+            "source_type": source_type,
+            "evidence_event_ids_json":
+                hi_json_dumps(
+                    evidence_event_ids
+                ),
+            "action_payload_json":
+                hi_json_dumps(
+                    action_payload
+                ),
+            "snapshot_json":
+                hi_json_dumps(
+                    snapshot
+                ),
+            "occurred_at": occurred_at,
+        },
+    )
+
+
+def persist_site_hi_revision(
+    conn: Connection,
+    *,
+    site_id: str,
+    expected_revision: int,
+    items: List[Dict[str, Any]],
+    action_type: str,
+    item_id: Optional[str],
+    actor_type: str,
+    actor_ref: Optional[str],
+    source_type: str,
+    evidence_event_ids: List[int],
+    action_payload: Dict[str, Any],
+    occurred_at: str,
+) -> Dict[str, Any]:
+    new_revision = expected_revision + 1
+    canonical_items = canonical_hi_items(
+        items
+    )
+
+    snapshot = {
+        "site_id": site_id,
+        "revision": new_revision,
+        "published_at": occurred_at,
+        "items": canonical_items,
+    }
+
+    content_json = hi_json_dumps(
+        {
+            "items": canonical_items,
+        }
+    )
+
+    result = execute_write(
+        conn,
+        """
+        UPDATE site_hi_state
+        SET revision = :new_revision,
+            content_json = :content_json,
+            published_at = :published_at,
+            updated_at = :updated_at
+        WHERE site_id = :site_id
+          AND revision = :expected_revision
+        """,
+        {
+            "new_revision": new_revision,
+            "content_json": content_json,
+            "published_at": occurred_at,
+            "updated_at": occurred_at,
+            "site_id": site_id,
+            "expected_revision":
+                expected_revision,
+        },
+    )
+
+    if (
+        result.rowcount == 0
+        and expected_revision == 0
+    ):
+        result = execute_write(
+            conn,
+            """
+            INSERT INTO site_hi_state (
+                site_id,
+                revision,
+                content_json,
+                published_at,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                :site_id,
+                :revision,
+                :content_json,
+                :published_at,
+                :created_at,
+                :updated_at
+            )
+            ON CONFLICT(site_id) DO NOTHING
+            """,
+            {
+                "site_id": site_id,
+                "revision": new_revision,
+                "content_json": content_json,
+                "published_at": occurred_at,
+                "created_at": occurred_at,
+                "updated_at": occurred_at,
+            },
+        )
+
+    if result.rowcount != 1:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "H&I revision conflict. Refresh current "
+                "Site H&I and retry."
+            ),
+        )
+
+    insert_site_hi_action(
+        conn,
+        site_id=site_id,
+        revision=new_revision,
+        action_type=action_type,
+        item_id=item_id,
+        actor_type=actor_type,
+        actor_ref=actor_ref,
+        source_type=source_type,
+        evidence_event_ids=evidence_event_ids,
+        action_payload=action_payload,
+        snapshot=snapshot,
+        occurred_at=occurred_at,
+    )
+
+    return snapshot
+
+
+def materialize_expired_hi_items(
+    conn: Connection,
+    site_id: str,
+) -> Dict[str, Any]:
+    """
+    Apply already-authorised valid_until rules lazily.
+
+    HI.2 correspondence correction:
+    expiry is a Backend system action, not an admin_operator
+    action. The action trail therefore records actor_type=system
+    and source_type=system_expiry so the audit chain never claims
+    a human cleared content they did not touch.
+    """
+    for _ in range(5):
+        snapshot = load_site_hi_snapshot_raw(
+            conn,
+            site_id,
+        )
+
+        if snapshot["revision"] == 0:
+            return snapshot
+
+        now_dt = datetime.now(
+            timezone.utc
+        )
+        expired_items: List[Dict[str, Any]] = []
+        retained_items: List[Dict[str, Any]] = []
+
+        for item in snapshot["items"]:
+            valid_until = item.get(
+                "valid_until"
+            )
+
+            if valid_until is None:
+                retained_items.append(
+                    item
+                )
+                continue
+
+            expiry_dt = parse_hi_datetime(
+                valid_until,
+                field_name="valid_until",
+                site_id=site_id,
+                storage=True,
+            )
+
+            if expiry_dt <= now_dt:
+                expired_items.append(
+                    item
+                )
+            else:
+                retained_items.append(
+                    item
+                )
+
+        if not expired_items:
+            return snapshot
+
+        occurred_at = utc_now_iso()
+        expected_revision = (
+            snapshot["revision"]
+        )
+        new_revision = (
+            expected_revision + 1
+        )
+        canonical_retained = (
+            canonical_hi_items(
+                retained_items
+            )
+        )
+
+        next_snapshot = {
+            "site_id": site_id,
+            "revision": new_revision,
+            "published_at": occurred_at,
+            "items": canonical_retained,
+        }
+
+        result = execute_write(
+            conn,
+            """
+            UPDATE site_hi_state
+            SET revision = :new_revision,
+                content_json = :content_json,
+                published_at = :published_at,
+                updated_at = :updated_at
+            WHERE site_id = :site_id
+              AND revision = :expected_revision
+            """,
+            {
+                "new_revision": new_revision,
+                "content_json":
+                    hi_json_dumps(
+                        {
+                            "items":
+                                canonical_retained,
+                        }
+                    ),
+                "published_at": occurred_at,
+                "updated_at": occurred_at,
+                "site_id": site_id,
+                "expected_revision":
+                    expected_revision,
+            },
+        )
+
+        if result.rowcount != 1:
+            # Another transaction changed H&I first. Reload and
+            # reassess instead of turning a read into a false
+            # operator conflict.
+            continue
+
+        evidence_ids: List[int] = []
+        seen_ids = set()
+
+        for item in expired_items:
+            for event_id in item.get(
+                "evidence_event_ids",
+                [],
+            ):
+                if event_id not in seen_ids:
+                    seen_ids.add(event_id)
+                    evidence_ids.append(
+                        event_id
+                    )
+
+        insert_site_hi_action(
+            conn,
+            site_id=site_id,
+            revision=new_revision,
+            action_type="expire_items",
+            item_id=None,
+            actor_type="system",
+            actor_ref=None,
+            source_type="system_expiry",
+            evidence_event_ids=evidence_ids,
+            action_payload={
+                "expired_item_ids": [
+                    item["item_id"]
+                    for item in expired_items
+                ],
+                "expired_items": expired_items,
+                "materialized_at": occurred_at,
+                "rule": (
+                    "valid_until <= backend_utc_now"
+                ),
+            },
+            snapshot=next_snapshot,
+            occurred_at=occurred_at,
+        )
+
+        return next_snapshot
+
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "H&I changed repeatedly while expiry was being "
+            "materialised. Retry the read."
+        ),
+    )
+
+
+def load_site_hi_snapshot(
+    conn: Connection,
+    site_id: str,
+) -> Dict[str, Any]:
+    return materialize_expired_hi_items(
+        conn,
+        site_id,
+    )
+
+
+def parse_hi_action_json(
+    site_id: str,
+    field_name: str,
+    value: Optional[str],
+    expected_type: type,
+) -> Any:
+    if value is None:
+        if expected_type is list:
+            return []
+        raise hi_integrity_error(
+            site_id,
+            f"{field_name} is missing.",
+        )
+
+    try:
+        decoded = json.loads(value)
+    except Exception as error:
+        raise hi_integrity_error(
+            site_id,
+            f"{field_name} is not valid JSON.",
+        ) from error
+
+    if not isinstance(decoded, expected_type):
+        raise hi_integrity_error(
+            site_id,
+            f"{field_name} has the wrong JSON shape.",
+        )
+
+    return decoded
+
+
+def site_hi_action_from_row(
+    site_id: str,
+    row: Dict[str, Any],
+) -> Dict[str, Any]:
+    action_id = row.get("id")
+    revision = row.get("revision")
+    action_type = row.get(
+        "action_type"
+    )
+    actor_type = row.get(
+        "actor_type"
+    )
+    source_type = row.get(
+        "source_type"
+    )
+    item_id = row.get("item_id")
+
+    if (
+        not isinstance(action_id, int)
+        or isinstance(action_id, bool)
+        or action_id < 1
+    ):
+        raise hi_integrity_error(
+            site_id,
+            "action history contains invalid action ID.",
+        )
+
+    if (
+        not isinstance(revision, int)
+        or isinstance(revision, bool)
+        or revision < 1
+    ):
+        raise hi_integrity_error(
+            site_id,
+            "action history contains invalid revision.",
+        )
+
+    if action_type not in HI_ACTION_TYPES:
+        raise hi_integrity_error(
+            site_id,
+            "action history contains unknown action_type.",
+        )
+
+    if actor_type not in HI_ACTION_ACTOR_TYPES:
+        raise hi_integrity_error(
+            site_id,
+            "action history contains unknown actor_type.",
+        )
+
+    if source_type not in HI_ACTION_SOURCE_TYPES:
+        raise hi_integrity_error(
+            site_id,
+            "action history contains unknown source_type.",
+        )
+
+    if action_type == "expire_items":
+        if item_id is not None:
+            raise hi_integrity_error(
+                site_id,
+                "expire_items action must not claim one item_id.",
+            )
+    elif (
+        not isinstance(item_id, str)
+        or not item_id.startswith("hi-")
+    ):
+        raise hi_integrity_error(
+            site_id,
+            "material item action has invalid item_id.",
+        )
+
+    parse_hi_datetime(
+        row.get("occurred_at"),
+        field_name="occurred_at",
+        site_id=site_id,
+        storage=True,
+    )
+
+    evidence_event_ids = (
+        parse_hi_action_json(
+            site_id,
+            "evidence_event_ids_json",
+            row.get(
+                "evidence_event_ids_json"
+            ),
+            list,
+        )
+    )
+
+    if len(evidence_event_ids) > 50:
+        raise hi_integrity_error(
+            site_id,
+            "action history contains too many evidence IDs.",
+        )
+
+    seen_ids = set()
+    for event_id in evidence_event_ids:
+        if (
+            not isinstance(event_id, int)
+            or isinstance(event_id, bool)
+            or event_id < 1
+            or event_id in seen_ids
+        ):
+            raise hi_integrity_error(
+                site_id,
+                "action history contains invalid evidence IDs.",
+            )
+        seen_ids.add(event_id)
+
+    action_payload = parse_hi_action_json(
+        site_id,
+        "action_payload_json",
+        row.get("action_payload_json"),
+        dict,
+    )
+
+    snapshot = parse_hi_action_json(
+        site_id,
+        "snapshot_json",
+        row.get("snapshot_json"),
+        dict,
+    )
+
+    if snapshot.get("site_id") != site_id:
+        raise hi_integrity_error(
+            site_id,
+            "action snapshot Site identity does not match action row.",
+        )
+
+    if snapshot.get("revision") != revision:
+        raise hi_integrity_error(
+            site_id,
+            "action snapshot revision does not match action row.",
+        )
+
+    parse_hi_datetime(
+        snapshot.get("published_at"),
+        field_name="snapshot.published_at",
+        site_id=site_id,
+        storage=True,
+    )
+
+    snapshot_items = snapshot.get("items")
+    if not isinstance(snapshot_items, list):
+        raise hi_integrity_error(
+            site_id,
+            "action snapshot items must be an array.",
+        )
+
+    for snapshot_item in snapshot_items:
+        if not isinstance(snapshot_item, dict):
+            raise hi_integrity_error(
+                site_id,
+                "action snapshot contains invalid item shape.",
+            )
+        validate_stored_hi_item(
+            site_id,
+            snapshot_item,
+        )
+
+    snapshot["items"] = canonical_hi_items(
+        snapshot_items
+    )
+
+    return {
+        "id": action_id,
+        "site_id": site_id,
+        "revision": revision,
+        "action_type": action_type,
+        "item_id": item_id,
+        "actor_type": actor_type,
+        "actor_ref": row.get("actor_ref"),
+        "source_type": source_type,
+        "evidence_event_ids":
+            evidence_event_ids,
+        "action_payload": action_payload,
+        "snapshot": snapshot,
+        "occurred_at": row.get(
+            "occurred_at"
+        ),
+    }
+
+
+def resolve_kiosk_hi_site_id(
+    conn: Connection,
+    kiosk_id: str,
+) -> str:
+    cleaned_kiosk_id = (
+        kiosk_id or ""
+    ).strip()
+
+    if not cleaned_kiosk_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid kiosk_id.",
+        )
+
+    site = fetch_one(
+        conn,
+        """
+        SELECT site_id
+        FROM sites
+        WHERE kiosk_id = :kiosk_id
+          AND operational_state = 'active'
+        """,
+        {
+            "kiosk_id": cleaned_kiosk_id,
+        },
+    )
+
+    if not site:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Kiosk is not bound to an "
+                "active Site."
+            ),
+        )
+
+    return str(site["site_id"])
 
 
 # =========================================================
@@ -1444,8 +2780,6 @@ async def admin_create_site(
                 latitude,
                 longitude,
                 site_policy_mode,
-                allow_kiosk_headcount_display,
-                allow_physical_headcount_display,
                 created_at,
                 updated_at
             )
@@ -1459,8 +2793,6 @@ async def admin_create_site(
                 :latitude,
                 :longitude,
                 :site_policy_mode,
-                :allow_kiosk_headcount_display,
-                :allow_physical_headcount_display,
                 :created_at,
                 :updated_at
             )
@@ -1480,10 +2812,6 @@ async def admin_create_site(
                     payload.longitude,
                 "site_policy_mode":
                     payload.site_policy_mode,
-                "allow_kiosk_headcount_display":
-                    1 if payload.allow_kiosk_headcount_display else 0,
-                "allow_physical_headcount_display":
-                    1 if payload.allow_physical_headcount_display else 0,
                 "created_at": now,
                 "updated_at": now,
             },
@@ -1516,8 +2844,6 @@ async def admin_list_sites():
                 s.latitude,
                 s.longitude,
                 s.site_policy_mode,
-                s.allow_kiosk_headcount_display,
-                s.allow_physical_headcount_display,
                 s.operational_state,
                 s.archived_at,
                 s.unlinked_at,
@@ -1547,22 +2873,6 @@ async def admin_list_sites():
         results = []
 
         for site in rows:
-            site[
-                "allow_kiosk_headcount_display"
-            ] = bool(
-                site.get(
-                    "allow_kiosk_headcount_display"
-                )
-            )
-
-            site[
-                "allow_physical_headcount_display"
-            ] = bool(
-                site.get(
-                    "allow_physical_headcount_display"
-                )
-            )
-
             site[
                 "in_active_crisis_area"
             ] = site_in_any_active_crisis(
@@ -1682,10 +2992,6 @@ async def admin_update_site(
                     longitude = :longitude,
                     site_policy_mode =
                         :site_policy_mode,
-                    allow_kiosk_headcount_display =
-                        :allow_kiosk_headcount_display,
-                    allow_physical_headcount_display =
-                        :allow_physical_headcount_display,
                     updated_at = :updated_at
                 WHERE site_id = :site_id
                   AND operational_state =
@@ -1717,14 +3023,6 @@ async def admin_update_site(
                         merged.get(
                             "site_policy_mode"
                         ),
-                    "allow_kiosk_headcount_display":
-                        1 if merged.get(
-                            "allow_kiosk_headcount_display"
-                        ) else 0,
-                    "allow_physical_headcount_display":
-                        1 if merged.get(
-                            "allow_physical_headcount_display"
-                        ) else 0,
                     "updated_at":
                         merged["updated_at"],
                     "site_id": site_id,
@@ -1760,10 +3058,6 @@ async def admin_update_site(
                     longitude = :longitude,
                     site_policy_mode =
                         :site_policy_mode,
-                    allow_kiosk_headcount_display =
-                        :allow_kiosk_headcount_display,
-                    allow_physical_headcount_display =
-                        :allow_physical_headcount_display,
                     updated_at = :updated_at
                 WHERE site_id = :site_id
                 """,
@@ -1792,14 +3086,6 @@ async def admin_update_site(
                         merged.get(
                             "site_policy_mode"
                         ),
-                    "allow_kiosk_headcount_display":
-                        1 if merged.get(
-                            "allow_kiosk_headcount_display"
-                        ) else 0,
-                    "allow_physical_headcount_display":
-                        1 if merged.get(
-                            "allow_physical_headcount_display"
-                        ) else 0,
                     "updated_at":
                         merged["updated_at"],
                     "site_id": site_id,
@@ -2344,6 +3630,314 @@ async def admin_site_events(
 
 
 # =========================================================
+# Admin - Site H&I Authority (HI.1 + HI.2)
+# =========================================================
+
+@app.get(
+    "/admin/sites/{site_id}/hi"
+)
+async def admin_site_hi(
+    site_id: str,
+):
+    with get_db() as conn:
+        # Archived Sites remain readable. Lazy expiry is a
+        # Backend materialisation of a pre-authorised time rule,
+        # not an Admin mutation.
+        require_hi_site(
+            conn,
+            site_id,
+        )
+
+        return load_site_hi_snapshot(
+            conn,
+            site_id,
+        )
+
+
+@app.get(
+    "/admin/sites/{site_id}/hi/actions"
+)
+async def admin_site_hi_actions(
+    site_id: str,
+    limit: int = Query(
+        default=100,
+        ge=1,
+        le=500,
+    ),
+    before_revision: Optional[int] = Query(
+        default=None,
+        ge=1,
+    ),
+):
+    with get_db() as conn:
+        require_hi_site(
+            conn,
+            site_id,
+        )
+
+        # "Every H&I read" includes history reads. Materialise
+        # any due expiry first so the returned action trail is
+        # current and complete to the read point.
+        load_site_hi_snapshot(
+            conn,
+            site_id,
+        )
+
+        clauses = [
+            "site_id = :site_id"
+        ]
+        params: Dict[str, Any] = {
+            "site_id": site_id,
+            "limit": limit,
+        }
+
+        if before_revision is not None:
+            clauses.append(
+                "revision < :before_revision"
+            )
+            params[
+                "before_revision"
+            ] = before_revision
+
+        rows = fetch_all(
+            conn,
+            f"""
+            SELECT
+                id,
+                site_id,
+                revision,
+                action_type,
+                item_id,
+                actor_type,
+                actor_ref,
+                source_type,
+                evidence_event_ids_json,
+                action_payload_json,
+                snapshot_json,
+                occurred_at
+            FROM site_hi_actions
+            WHERE {' AND '.join(clauses)}
+            ORDER BY revision DESC
+            LIMIT :limit
+            """,
+            params,
+        )
+
+        return [
+            site_hi_action_from_row(
+                site_id,
+                row,
+            )
+            for row in rows
+        ]
+
+
+@app.post(
+    "/admin/sites/{site_id}/hi/items"
+)
+async def admin_create_site_hi_item(
+    site_id: str,
+    payload: SiteHiItemMutationRequest,
+):
+    with get_db() as conn:
+        require_hi_mutation_site(
+            conn,
+            site_id,
+        )
+
+        snapshot = load_site_hi_snapshot(
+            conn,
+            site_id,
+        )
+
+        require_expected_hi_revision(
+            snapshot,
+            payload.expected_revision,
+        )
+
+        item = build_hi_item_from_payload(
+            conn,
+            site_id,
+            payload,
+        )
+
+        occurred_at = item[
+            "updated_at"
+        ]
+
+        return persist_site_hi_revision(
+            conn,
+            site_id=site_id,
+            expected_revision=
+                snapshot["revision"],
+            items=[
+                *snapshot["items"],
+                item,
+            ],
+            action_type="publish_item",
+            item_id=item["item_id"],
+            actor_type="admin_operator",
+            actor_ref=None,
+            source_type=
+                item["source_type"],
+            evidence_event_ids=
+                item[
+                    "evidence_event_ids"
+                ],
+            action_payload={
+                "after": item,
+            },
+            occurred_at=occurred_at,
+        )
+
+
+@app.put(
+    "/admin/sites/{site_id}/hi/items/{item_id}"
+)
+async def admin_update_site_hi_item(
+    site_id: str,
+    item_id: str,
+    payload: SiteHiItemMutationRequest,
+):
+    with get_db() as conn:
+        require_hi_mutation_site(
+            conn,
+            site_id,
+        )
+
+        snapshot = load_site_hi_snapshot(
+            conn,
+            site_id,
+        )
+
+        require_expected_hi_revision(
+            snapshot,
+            payload.expected_revision,
+        )
+
+        existing = find_current_hi_item(
+            snapshot,
+            item_id,
+        )
+
+        item = build_hi_item_from_payload(
+            conn,
+            site_id,
+            payload,
+            existing=existing,
+        )
+
+        next_items = [
+            item
+            if current.get("item_id")
+            == item_id
+            else current
+            for current in snapshot["items"]
+        ]
+
+        occurred_at = item[
+            "updated_at"
+        ]
+
+        return persist_site_hi_revision(
+            conn,
+            site_id=site_id,
+            expected_revision=
+                snapshot["revision"],
+            items=next_items,
+            action_type="edit_item",
+            item_id=item_id,
+            actor_type="admin_operator",
+            actor_ref=None,
+            source_type=
+                item["source_type"],
+            evidence_event_ids=
+                item[
+                    "evidence_event_ids"
+                ],
+            action_payload={
+                "before": existing,
+                "after": item,
+            },
+            occurred_at=occurred_at,
+        )
+
+
+@app.post(
+    "/admin/sites/{site_id}/hi/items/{item_id}/clear"
+)
+async def admin_clear_site_hi_item(
+    site_id: str,
+    item_id: str,
+    payload: SiteHiClearRequest,
+):
+    with get_db() as conn:
+        require_hi_mutation_site(
+            conn,
+            site_id,
+        )
+
+        snapshot = load_site_hi_snapshot(
+            conn,
+            site_id,
+        )
+
+        require_expected_hi_revision(
+            snapshot,
+            payload.expected_revision,
+        )
+
+        existing = find_current_hi_item(
+            snapshot,
+            item_id,
+        )
+
+        reason = payload.reason.strip()
+
+        if not reason:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "H&I clear reason cannot be blank."
+                ),
+            )
+
+        next_items = [
+            current
+            for current in snapshot["items"]
+            if current.get("item_id")
+            != item_id
+        ]
+
+        occurred_at = utc_now_iso()
+
+        return persist_site_hi_revision(
+            conn,
+            site_id=site_id,
+            expected_revision=
+                snapshot["revision"],
+            items=next_items,
+            action_type="clear_item",
+            item_id=item_id,
+            actor_type="admin_operator",
+            actor_ref=None,
+            source_type="manual_operator",
+            evidence_event_ids=list(
+                existing.get(
+                    "evidence_event_ids",
+                    [],
+                )
+            ),
+            action_payload={
+                "before": existing,
+                "reason": reason,
+                "resolution_claimed": False,
+            },
+            occurred_at=occurred_at,
+        )
+
+
+# =========================================================
 # Admin - Crisis Control
 # =========================================================
 
@@ -2555,19 +4149,53 @@ async def ncm_sites():
         )
 
         for site in rows:
-            classification = (
-                classify_ncm_site_state(
+            in_crisis_area = (
+                site_in_any_active_crisis(
                     site,
                     crises,
                 )
             )
 
-            if classification.get(
-                "ncm_state"
+            ncm_state = None
+            priority = None
+
+            if site.get(
+                "sos_active"
             ):
-                site.update(
-                    classification
+                ncm_state = "red"
+                priority = 1
+
+            elif (
+                in_crisis_area
+                and site.get(
+                    "active_count",
+                    0,
+                ) > 0
+                and not site.get(
+                    "full_headcount_confirmed"
                 )
+            ):
+                ncm_state = "orange"
+                priority = 2
+
+            elif site.get(
+                "full_headcount_confirmed"
+            ):
+                ncm_state = "green"
+                priority = 3
+
+            if ncm_state:
+                site[
+                    "ncm_state"
+                ] = ncm_state
+
+                site[
+                    "priority"
+                ] = priority
+
+                site[
+                    "in_active_crisis_area"
+                ] = in_crisis_area
 
                 sites.append(site)
 
@@ -2591,156 +4219,22 @@ async def ncm_sites():
 # Kiosk API
 # =========================================================
 
-@app.get("/kiosk/bootstrap/{kiosk_id}")
-async def kiosk_bootstrap(
+@app.get(
+    "/api/kiosks/{kiosk_id}/hi"
+)
+async def api_kiosk_hi(
     kiosk_id: str,
 ):
-    cleaned_kiosk_id = (
-        kiosk_id or ""
-    ).strip()
-
-    if not cleaned_kiosk_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid kiosk_id.",
-        )
-
     with get_db() as conn:
-        binding = fetch_one(
+        site_id = resolve_kiosk_hi_site_id(
             conn,
-            """
-            SELECT site_id
-            FROM sites
-            WHERE kiosk_id = :kiosk_id
-              AND operational_state =
-                    'active'
-            """,
-            {
-                "kiosk_id":
-                    cleaned_kiosk_id,
-            },
+            kiosk_id,
         )
 
-        if not binding:
-            return {
-                "kiosk_id":
-                    cleaned_kiosk_id,
-                "bound": False,
-                "site": None,
-                "status": None,
-                "permissions": {
-                    "allow_kiosk_headcount_display": False,
-                    "allow_physical_headcount_display": False,
-                },
-                "ncm_state": None,
-                "in_active_crisis_area":
-                    False,
-            }
-
-        site_id = binding[
-            "site_id"
-        ]
-
-        ensure_site_status(
+        return load_site_hi_snapshot(
             conn,
             site_id,
         )
-
-        site = fetch_site_summary(
-            conn,
-            site_id,
-        )
-
-        crises = list_active_crises(
-            conn
-        )
-
-        classification = (
-            classify_ncm_site_state(
-                site,
-                crises,
-            )
-        )
-
-        return {
-            "kiosk_id":
-                cleaned_kiosk_id,
-            "bound": True,
-            "site": {
-                "site_id":
-                    site["site_id"],
-                "name":
-                    site["name"],
-                "site_policy_mode":
-                    site.get(
-                        "site_policy_mode"
-                    )
-                    or "standard",
-                "operational_state":
-                    site.get(
-                        "operational_state"
-                    )
-                    or "active",
-            },
-            "status": {
-                "status":
-                    site.get(
-                        "status"
-                    )
-                    or "idle",
-                "active_count":
-                    int(
-                        site.get(
-                            "active_count"
-                        )
-                        or 0
-                    ),
-                "headcount_status":
-                    site.get(
-                        "headcount_status"
-                    )
-                    or "pending",
-                "sos_active": bool(
-                    site.get(
-                        "sos_active"
-                    )
-                ),
-                "full_headcount_confirmed":
-                    bool(
-                        site.get(
-                            "full_headcount_confirmed"
-                        )
-                    ),
-                "last_event_at":
-                    site.get(
-                        "last_event_at"
-                    ),
-            },
-            "permissions": {
-                "allow_kiosk_headcount_display":
-                    bool(
-                        site.get(
-                            "allow_kiosk_headcount_display"
-                        )
-                    ),
-                "allow_physical_headcount_display":
-                    bool(
-                        site.get(
-                            "allow_physical_headcount_display"
-                        )
-                    ),
-            },
-            "ncm_state":
-                classification.get(
-                    "ncm_state"
-                ),
-            "in_active_crisis_area":
-                bool(
-                    classification.get(
-                        "in_active_crisis_area"
-                    )
-                ),
-        }
 
 
 @app.post("/api/signin")
@@ -2787,10 +4281,6 @@ async def api_signin(
                 payload.role,
             "action":
                 sign_event_type,
-            "source":
-                normalise_event_source(
-                    payload.source
-                ),
         }
 
         event_id = insert_event(
@@ -2843,10 +4333,6 @@ async def api_hazard(
                 payload.description,
             "severity":
                 payload.severity,
-            "source":
-                normalise_event_source(
-                    payload.source
-                ),
         }
 
         event_id = insert_event(
@@ -2898,10 +4384,6 @@ async def api_incident(
                 payload.description,
             "injury":
                 payload.injury,
-            "source":
-                normalise_event_source(
-                    payload.source
-                ),
         }
 
         event_id = insert_event(
@@ -2954,10 +4436,6 @@ async def api_sos(
                 occurred_at,
             payload={
                 "note": payload.note,
-                "source":
-                    normalise_event_source(
-                        payload.source
-                    ),
             },
         )
 
@@ -3000,10 +4478,6 @@ async def api_full_headcount(
                 occurred_at,
             payload={
                 "note": payload.note,
-                "source":
-                    normalise_event_source(
-                        payload.source
-                    ),
             },
         )
 
@@ -3018,3 +4492,8 @@ async def api_full_headcount(
             "site_id": site_id,
             **state,
         }
+
+
+
+
+
