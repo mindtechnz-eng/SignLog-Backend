@@ -786,14 +786,39 @@ class CreateCrisisRequest(BaseModel):
 # H&I Mutation Models (HI.2)
 # =========================================================
 
+HiCategory = Literal[
+    "current_hazard",
+    "temporary_update",
+    "site_information",
+]
+
+HiSectionKey = Literal[
+    "ppe",
+    "awareness_update",
+    "site_hazards",
+    "site_contact",
+    "evacuation_point",
+    "emergency_aid_location",
+    "general_site_information",
+]
+
+
+class SiteHiOutputPolicyRequest(BaseModel):
+    kiosk_hi_module_enabled: bool
+    physical_site_db_enabled: bool
+
+
 class SiteHiItemMutationRequest(BaseModel):
     expected_revision: int = Field(ge=0)
 
-    category: Literal[
-        "current_hazard",
-        "temporary_update",
-        "site_information",
-    ]
+    category: HiCategory
+
+    # HI.4C.1 calibration: old Admin callers may omit these
+    # fields. Backend then preserves existing structured
+    # semantics on edit, or derives a safe legacy-compatible
+    # section identity on create.
+    section_key: Optional[HiSectionKey] = None
+    section_data: Optional[Dict[str, Any]] = None
 
     title: str = Field(
         min_length=1,
@@ -811,6 +836,39 @@ class SiteHiItemMutationRequest(BaseModel):
 
     valid_until: Optional[str] = None
     evidence_event_ids: Optional[List[int]] = None
+
+
+class SiteHiBoardItemRequest(BaseModel):
+    item_id: Optional[str] = None
+    section_key: HiSectionKey
+    category: Optional[HiCategory] = None
+    section_data: Dict[str, Any] = Field(default_factory=dict)
+
+    title: str = Field(
+        min_length=1,
+        max_length=120,
+    )
+    message: str = Field(
+        min_length=1,
+        max_length=1500,
+    )
+    display_order: int = Field(
+        ge=0,
+        le=999,
+    )
+    valid_until: Optional[str] = None
+    evidence_event_ids: Optional[List[int]] = None
+
+
+class SiteHiBoardMutationRequest(BaseModel):
+    expected_revision: int = Field(ge=0)
+    output_policy: SiteHiOutputPolicyRequest
+    items: List[SiteHiBoardItemRequest]
+
+
+class SiteHiOutputPolicyMutationRequest(BaseModel):
+    expected_revision: int = Field(ge=0)
+    output_policy: SiteHiOutputPolicyRequest
 
 
 class SiteHiClearRequest(BaseModel):
@@ -1378,10 +1436,35 @@ def site_in_any_active_crisis(
 # H&I - Authoritative Domain Helpers (HI.1 + HI.2)
 # =========================================================
 
+HI_SCHEMA_VERSION = 2
+
 HI_CATEGORY_ORDER = {
     "current_hazard": 0,
     "temporary_update": 1,
     "site_information": 2,
+}
+
+HI_SECTION_CATEGORY = {
+    "ppe": "site_information",
+    "awareness_update": "temporary_update",
+    "site_hazards": "current_hazard",
+    "site_contact": "site_information",
+    "evacuation_point": "site_information",
+    "emergency_aid_location": "site_information",
+    "general_site_information": "site_information",
+}
+
+HI_LEGACY_SECTION_BY_CATEGORY = {
+    "current_hazard": "site_hazards",
+    "temporary_update": "awareness_update",
+    "site_information": "general_site_information",
+}
+
+HI_DEFAULT_OUTPUT_POLICY = {
+    # Preserve deployed HI.4 behaviour during schema migration.
+    "kiosk_hi_module_enabled": True,
+    # Physical DB remains downstream until its own program.
+    "physical_site_db_enabled": False,
 }
 
 HI_ITEM_SOURCE_TYPES = {
@@ -1394,6 +1477,16 @@ HI_ACTION_TYPES = {
     "edit_item",
     "clear_item",
     "expire_items",
+    "publish_board",
+    "update_board",
+    "set_output_policy",
+}
+
+HI_BOARD_LEVEL_ACTION_TYPES = {
+    "expire_items",
+    "publish_board",
+    "update_board",
+    "set_output_policy",
 }
 
 HI_ACTION_ACTOR_TYPES = {
@@ -1461,6 +1554,10 @@ def require_hi_mutation_site(
     return site
 
 
+def default_hi_output_policy() -> Dict[str, bool]:
+    return dict(HI_DEFAULT_OUTPUT_POLICY)
+
+
 def empty_site_hi_snapshot(
     site_id: str,
 ) -> Dict[str, Any]:
@@ -1468,6 +1565,8 @@ def empty_site_hi_snapshot(
         "site_id": site_id,
         "revision": 0,
         "published_at": None,
+        "schema_version": HI_SCHEMA_VERSION,
+        "output_policy": default_hi_output_policy(),
         "items": [],
     }
 
@@ -1556,6 +1655,305 @@ def parse_hi_datetime(
         ) from error
 
 
+def normalise_hi_output_policy(
+    value: Any,
+    *,
+    site_id: Optional[str] = None,
+    storage: bool = False,
+) -> Dict[str, bool]:
+    if value is None:
+        return default_hi_output_policy()
+
+    if not isinstance(value, dict):
+        if storage and site_id:
+            raise hi_integrity_error(
+                site_id,
+                "output_policy must be an object.",
+            )
+        raise HTTPException(
+            status_code=400,
+            detail="H&I output_policy must be an object.",
+        )
+
+    allowed = {
+        "kiosk_hi_module_enabled",
+        "physical_site_db_enabled",
+    }
+    unknown = set(value) - allowed
+
+    if unknown:
+        message = (
+            "output_policy contains unknown fields: "
+            + ", ".join(sorted(unknown))
+        )
+        if storage and site_id:
+            raise hi_integrity_error(site_id, message)
+        raise HTTPException(status_code=400, detail=f"H&I {message}")
+
+    result = default_hi_output_policy()
+    for key in allowed:
+        if key not in value:
+            continue
+        current = value[key]
+        if not isinstance(current, bool):
+            if storage and site_id:
+                raise hi_integrity_error(
+                    site_id,
+                    f"output_policy.{key} must be boolean.",
+                )
+            raise HTTPException(
+                status_code=400,
+                detail=f"H&I output_policy.{key} must be boolean.",
+            )
+        result[key] = current
+
+    return result
+
+
+def _hi_clean_section_string(
+    value: Any,
+    *,
+    field_name: str,
+    required: bool = False,
+    max_length: int = 250,
+) -> Optional[str]:
+    if value is None:
+        if required:
+            raise HTTPException(
+                status_code=400,
+                detail=f"H&I section_data.{field_name} is required.",
+            )
+        return None
+
+    if not isinstance(value, str):
+        raise HTTPException(
+            status_code=400,
+            detail=f"H&I section_data.{field_name} must be text.",
+        )
+
+    cleaned = value.strip()
+    if not cleaned:
+        if required:
+            raise HTTPException(
+                status_code=400,
+                detail=f"H&I section_data.{field_name} cannot be blank.",
+            )
+        return None
+
+    if len(cleaned) > max_length:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"H&I section_data.{field_name} exceeds "
+                f"{max_length} characters."
+            ),
+        )
+
+    return cleaned
+
+
+def normalise_hi_section_data(
+    section_key: str,
+    value: Any,
+) -> Dict[str, Any]:
+    if section_key not in HI_SECTION_CATEGORY:
+        raise HTTPException(
+            status_code=400,
+            detail="Unknown H&I section_key.",
+        )
+
+    if value is None:
+        value = {}
+
+    if not isinstance(value, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="H&I section_data must be an object.",
+        )
+
+    if len(hi_json_dumps(value).encode("utf-8")) > 4096:
+        raise HTTPException(
+            status_code=400,
+            detail="H&I section_data is too large.",
+        )
+
+    schemas = {
+        "ppe": {"requirements", "custom_requirement", "note"},
+        "awareness_update": set(),
+        "site_hazards": set(),
+        "site_contact": {"role", "name", "contact"},
+        "evacuation_point": {"location", "instruction"},
+        "emergency_aid_location": {
+            "first_aid_contact",
+            "contact",
+            "kit_location",
+            "external_aid_location",
+        },
+        "general_site_information": set(),
+    }
+
+    allowed = schemas[section_key]
+    unknown = set(value) - allowed
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"H&I {section_key} section_data contains unknown fields: "
+                + ", ".join(sorted(unknown))
+            ),
+        )
+
+    if section_key in {
+        "awareness_update",
+        "site_hazards",
+        "general_site_information",
+    }:
+        return {}
+
+    if section_key == "ppe":
+        requirements = value.get("requirements", [])
+        if not isinstance(requirements, list):
+            raise HTTPException(
+                status_code=400,
+                detail="H&I section_data.requirements must be an array.",
+            )
+        if len(requirements) > 30:
+            raise HTTPException(
+                status_code=400,
+                detail="H&I PPE may contain at most 30 requirements.",
+            )
+
+        cleaned_requirements: List[str] = []
+        seen = set()
+        for raw in requirements:
+            cleaned = _hi_clean_section_string(
+                raw,
+                field_name="requirements[]",
+                required=True,
+                max_length=80,
+            )
+            assert cleaned is not None
+            key = cleaned.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned_requirements.append(cleaned)
+
+        custom = _hi_clean_section_string(
+            value.get("custom_requirement"),
+            field_name="custom_requirement",
+            max_length=120,
+        )
+        note = _hi_clean_section_string(
+            value.get("note"),
+            field_name="note",
+            max_length=300,
+        )
+
+        if not cleaned_requirements and not custom:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "H&I PPE requires at least one requirement "
+                    "or a custom_requirement."
+                ),
+            )
+
+        result: Dict[str, Any] = {
+            "requirements": cleaned_requirements,
+        }
+        if custom is not None:
+            result["custom_requirement"] = custom
+        if note is not None:
+            result["note"] = note
+        return result
+
+    if section_key == "site_contact":
+        return {
+            "role": _hi_clean_section_string(
+                value.get("role"),
+                field_name="role",
+                required=True,
+                max_length=120,
+            ),
+            "name": _hi_clean_section_string(
+                value.get("name"),
+                field_name="name",
+                required=True,
+                max_length=120,
+            ),
+            "contact": _hi_clean_section_string(
+                value.get("contact"),
+                field_name="contact",
+                required=True,
+                max_length=160,
+            ),
+        }
+
+    if section_key == "evacuation_point":
+        result = {
+            "location": _hi_clean_section_string(
+                value.get("location"),
+                field_name="location",
+                required=True,
+                max_length=250,
+            ),
+        }
+        instruction = _hi_clean_section_string(
+            value.get("instruction"),
+            field_name="instruction",
+            max_length=300,
+        )
+        if instruction is not None:
+            result["instruction"] = instruction
+        return result
+
+    if section_key == "emergency_aid_location":
+        result = {}
+        for key, max_length in (
+            ("first_aid_contact", 160),
+            ("contact", 160),
+            ("kit_location", 250),
+            ("external_aid_location", 300),
+        ):
+            cleaned = _hi_clean_section_string(
+                value.get(key),
+                field_name=key,
+                max_length=max_length,
+            )
+            if cleaned is not None:
+                result[key] = cleaned
+
+        if not result.get("kit_location") and not result.get("external_aid_location"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "H&I emergency_aid_location requires "
+                    "kit_location or external_aid_location."
+                ),
+            )
+        return result
+
+    raise HTTPException(
+        status_code=400,
+        detail="Unsupported H&I section_key.",
+    )
+
+
+def normalise_stored_hi_section_data(
+    site_id: str,
+    section_key: str,
+    value: Any,
+) -> Dict[str, Any]:
+    try:
+        return normalise_hi_section_data(section_key, value)
+    except HTTPException as error:
+        raise hi_integrity_error(
+            site_id,
+            f"stored {section_key} section_data is invalid: {error.detail}",
+        ) from error
+
+
 def canonical_hi_items(
     items: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
@@ -1572,19 +1970,18 @@ def canonical_hi_items(
     )
 
 
-def validate_stored_hi_item(
+def normalise_stored_hi_item(
     site_id: str,
-    item: Dict[str, Any],
-) -> None:
+    raw_item: Dict[str, Any],
+) -> Dict[str, Any]:
+    item = dict(raw_item)
     item_id = item.get("item_id")
     category = item.get("category")
     title = item.get("title")
     message = item.get("message")
     display_order = item.get("display_order")
     source_type = item.get("source_type")
-    evidence_event_ids = item.get(
-        "evidence_event_ids"
-    )
+    evidence_event_ids = item.get("evidence_event_ids")
 
     if (
         not isinstance(item_id, str)
@@ -1601,6 +1998,40 @@ def validate_stored_hi_item(
             site_id,
             "stored item has an unknown category.",
         )
+
+    had_explicit_section_key = "section_key" in item
+    section_key = item.get("section_key")
+    if section_key is None:
+        section_key = HI_LEGACY_SECTION_BY_CATEGORY[category]
+    if section_key not in HI_SECTION_CATEGORY:
+        raise hi_integrity_error(
+            site_id,
+            "stored item has an unknown section_key.",
+        )
+    if HI_SECTION_CATEGORY[section_key] != category:
+        raise hi_integrity_error(
+            site_id,
+            "stored item section_key/category do not agree.",
+        )
+
+    section_data = item.get("section_data")
+    if section_data is None:
+        # Legacy HI.1-HI.4 rows had neither section_key nor
+        # section_data. They are projected through a safe inferred
+        # section identity without inventing structured values. A v2
+        # item that explicitly names a structured section but omits
+        # section_data is an integrity error, not a legacy row.
+        if had_explicit_section_key:
+            section_data = {}
+        else:
+            section_key = HI_LEGACY_SECTION_BY_CATEGORY[category]
+            section_data = {}
+
+    section_data = normalise_stored_hi_section_data(
+        site_id,
+        section_key,
+        section_data,
+    )
 
     if (
         not isinstance(title, str)
@@ -1652,7 +2083,6 @@ def validate_stored_hi_item(
         )
 
     seen_ids = set()
-
     for event_id in evidence_event_ids:
         if (
             not isinstance(event_id, int)
@@ -1666,11 +2096,7 @@ def validate_stored_hi_item(
             )
         seen_ids.add(event_id)
 
-    for field_name in (
-        "valid_from",
-        "created_at",
-        "updated_at",
-    ):
+    for field_name in ("valid_from", "created_at", "updated_at"):
         parse_hi_datetime(
             item.get(field_name),
             field_name=field_name,
@@ -1679,7 +2105,6 @@ def validate_stored_hi_item(
         )
 
     valid_until = item.get("valid_until")
-
     if valid_until is not None:
         parse_hi_datetime(
             valid_until,
@@ -1688,30 +2113,34 @@ def validate_stored_hi_item(
             storage=True,
         )
 
-    if (
-        category == "temporary_update"
-        and valid_until is None
-    ):
+    if category == "temporary_update" and valid_until is None:
         raise hi_integrity_error(
             site_id,
             "stored temporary update is missing valid_until.",
         )
 
+    item["section_key"] = section_key
+    item["section_data"] = section_data
+    return item
+
+
+def validate_stored_hi_item(
+    site_id: str,
+    item: Dict[str, Any],
+) -> None:
+    normalise_stored_hi_item(site_id, item)
 
 def parse_site_hi_content(
     site_id: str,
     value: Optional[str],
-) -> List[Dict[str, Any]]:
+) -> Dict[str, Any]:
     """
-    H&I current-state JSON is authority-bearing data.
-    Malformed H&I storage must never be silently coerced into
-    an empty state.
+    Parse authority-bearing H&I state. HI.4C.1 accepts legacy
+    HI.1-HI.4 content and presents it through the v2 board
+    contract without manufacturing a material revision.
     """
     if value is None:
-        raise hi_integrity_error(
-            site_id,
-            "content_json is missing.",
-        )
+        raise hi_integrity_error(site_id, "content_json is missing.")
 
     try:
         decoded = json.loads(value)
@@ -1727,30 +2156,42 @@ def parse_site_hi_content(
             "content_json must contain an object.",
         )
 
-    items = decoded.get("items")
+    raw_schema_version = decoded.get("schema_version", 1)
+    if raw_schema_version not in {1, HI_SCHEMA_VERSION}:
+        raise hi_integrity_error(
+            site_id,
+            "content_json has unsupported schema_version.",
+        )
 
+    output_policy = normalise_hi_output_policy(
+        decoded.get("output_policy"),
+        site_id=site_id,
+        storage=True,
+    )
+
+    items = decoded.get("items")
     if not isinstance(items, list):
         raise hi_integrity_error(
             site_id,
             "content_json.items must be an array.",
         )
 
+    normalised_items: List[Dict[str, Any]] = []
     for item in items:
         if not isinstance(item, dict):
             raise hi_integrity_error(
                 site_id,
                 "every H&I item must be an object.",
             )
-
-        validate_stored_hi_item(
-            site_id,
-            item,
+        normalised_items.append(
+            normalise_stored_hi_item(site_id, item)
         )
 
-    return canonical_hi_items(
-        items
-    )
-
+    return {
+        "schema_version": HI_SCHEMA_VERSION,
+        "output_policy": output_policy,
+        "items": canonical_hi_items(normalised_items),
+    }
 
 def load_site_hi_snapshot_raw(
     conn: Connection,
@@ -1791,7 +2232,7 @@ def load_site_hi_snapshot_raw(
             "revision is invalid.",
         )
 
-    items = parse_site_hi_content(
+    content = parse_site_hi_content(
         site_id,
         row.get("content_json"),
     )
@@ -1818,7 +2259,9 @@ def load_site_hi_snapshot_raw(
         "site_id": site_id,
         "revision": revision,
         "published_at": published_at,
-        "items": items,
+        "schema_version": content["schema_version"],
+        "output_policy": content["output_policy"],
+        "items": content["items"],
     }
 
 
@@ -1907,6 +2350,7 @@ def build_hi_item_from_payload(
     payload: SiteHiItemMutationRequest,
     *,
     existing: Optional[Dict[str, Any]] = None,
+    allow_no_change: bool = False,
 ) -> Dict[str, Any]:
     title = payload.title.strip()
     message = payload.message.strip()
@@ -1977,6 +2421,34 @@ def build_hi_item_from_payload(
         else "manual_operator"
     )
 
+    section_key = payload.section_key
+    if section_key is None and existing:
+        section_key = existing.get("section_key")
+    if section_key is None:
+        section_key = HI_LEGACY_SECTION_BY_CATEGORY[payload.category]
+
+    expected_category = HI_SECTION_CATEGORY.get(section_key)
+    if expected_category != payload.category:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"H&I section_key {section_key} requires category "
+                f"{expected_category}."
+            ),
+        )
+
+    if payload.section_data is not None:
+        raw_section_data = payload.section_data
+    elif existing and section_key == existing.get("section_key"):
+        raw_section_data = existing.get("section_data", {})
+    else:
+        raw_section_data = {}
+
+    section_data = normalise_hi_section_data(
+        section_key,
+        raw_section_data,
+    )
+
     item_id = (
         existing["item_id"]
         if existing
@@ -1995,6 +2467,8 @@ def build_hi_item_from_payload(
     item = {
         "item_id": item_id,
         "category": payload.category,
+        "section_key": section_key,
+        "section_data": section_data,
         "title": title,
         "message": message,
         "display_order": payload.display_order,
@@ -2007,9 +2481,11 @@ def build_hi_item_from_payload(
         "updated_at": now,
     }
 
-    if existing:
+    if existing and not allow_no_change:
         comparable_fields = (
             "category",
+            "section_key",
+            "section_data",
             "title",
             "message",
             "display_order",
@@ -2031,6 +2507,78 @@ def build_hi_item_from_payload(
             )
 
     return item
+
+
+def build_hi_board_item(
+    conn: Connection,
+    site_id: str,
+    payload: SiteHiBoardItemRequest,
+    *,
+    existing: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    expected_category = HI_SECTION_CATEGORY[payload.section_key]
+    if payload.category is not None and payload.category != expected_category:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"H&I section_key {payload.section_key} requires category "
+                f"{expected_category}."
+            ),
+        )
+
+    mutation = SiteHiItemMutationRequest(
+        expected_revision=0,
+        category=expected_category,
+        section_key=payload.section_key,
+        section_data=payload.section_data,
+        title=payload.title,
+        message=payload.message,
+        display_order=payload.display_order,
+        valid_until=payload.valid_until,
+        evidence_event_ids=payload.evidence_event_ids,
+    )
+
+    candidate = build_hi_item_from_payload(
+        conn,
+        site_id,
+        mutation,
+        existing=existing,
+        allow_no_change=True,
+    )
+
+    if existing:
+        material_fields = (
+            "category",
+            "section_key",
+            "section_data",
+            "title",
+            "message",
+            "display_order",
+            "valid_until",
+            "source_type",
+            "evidence_event_ids",
+        )
+        if all(
+            existing.get(field_name) == candidate.get(field_name)
+            for field_name in material_fields
+        ):
+            return existing
+
+    return candidate
+
+
+def aggregate_hi_evidence_ids(
+    items: List[Dict[str, Any]],
+) -> List[int]:
+    result: List[int] = []
+    seen = set()
+    for item in items:
+        for event_id in item.get("evidence_event_ids", []):
+            if event_id in seen:
+                continue
+            seen.add(event_id)
+            result.append(event_id)
+    return result
 
 
 def require_expected_hi_revision(
@@ -2155,6 +2703,7 @@ def persist_site_hi_revision(
     site_id: str,
     expected_revision: int,
     items: List[Dict[str, Any]],
+    output_policy: Dict[str, bool],
     action_type: str,
     item_id: Optional[str],
     actor_type: str,
@@ -2169,15 +2718,21 @@ def persist_site_hi_revision(
         items
     )
 
+    canonical_policy = normalise_hi_output_policy(output_policy)
+
     snapshot = {
         "site_id": site_id,
         "revision": new_revision,
         "published_at": occurred_at,
+        "schema_version": HI_SCHEMA_VERSION,
+        "output_policy": canonical_policy,
         "items": canonical_items,
     }
 
     content_json = hi_json_dumps(
         {
+            "schema_version": HI_SCHEMA_VERSION,
+            "output_policy": canonical_policy,
             "items": canonical_items,
         }
     )
@@ -2341,6 +2896,8 @@ def materialize_expired_hi_items(
             "site_id": site_id,
             "revision": new_revision,
             "published_at": occurred_at,
+            "schema_version": HI_SCHEMA_VERSION,
+            "output_policy": snapshot["output_policy"],
             "items": canonical_retained,
         }
 
@@ -2360,8 +2917,9 @@ def materialize_expired_hi_items(
                 "content_json":
                     hi_json_dumps(
                         {
-                            "items":
-                                canonical_retained,
+                            "schema_version": HI_SCHEMA_VERSION,
+                            "output_policy": snapshot["output_policy"],
+                            "items": canonical_retained,
                         }
                     ),
                 "published_at": occurred_at,
@@ -2524,11 +3082,11 @@ def site_hi_action_from_row(
             "action history contains unknown source_type.",
         )
 
-    if action_type == "expire_items":
+    if action_type in HI_BOARD_LEVEL_ACTION_TYPES:
         if item_id is not None:
             raise hi_integrity_error(
                 site_id,
-                "expire_items action must not claim one item_id.",
+                f"{action_type} action must not claim one item_id.",
             )
     elif (
         not isinstance(item_id, str)
@@ -2557,7 +3115,7 @@ def site_hi_action_from_row(
         )
     )
 
-    if len(evidence_event_ids) > 50:
+    if len(evidence_event_ids) > 2000:
         raise hi_integrity_error(
             site_id,
             "action history contains too many evidence IDs.",
@@ -2610,6 +3168,12 @@ def site_hi_action_from_row(
         storage=True,
     )
 
+    snapshot_policy = normalise_hi_output_policy(
+        snapshot.get("output_policy"),
+        site_id=site_id,
+        storage=True,
+    )
+
     snapshot_items = snapshot.get("items")
     if not isinstance(snapshot_items, list):
         raise hi_integrity_error(
@@ -2617,19 +3181,21 @@ def site_hi_action_from_row(
             "action snapshot items must be an array.",
         )
 
+    normalised_snapshot_items: List[Dict[str, Any]] = []
     for snapshot_item in snapshot_items:
         if not isinstance(snapshot_item, dict):
             raise hi_integrity_error(
                 site_id,
                 "action snapshot contains invalid item shape.",
             )
-        validate_stored_hi_item(
-            site_id,
-            snapshot_item,
+        normalised_snapshot_items.append(
+            normalise_stored_hi_item(site_id, snapshot_item)
         )
 
+    snapshot["schema_version"] = HI_SCHEMA_VERSION
+    snapshot["output_policy"] = snapshot_policy
     snapshot["items"] = canonical_hi_items(
-        snapshot_items
+        normalised_snapshot_items
     )
 
     return {
@@ -3774,6 +4340,7 @@ async def admin_create_site_hi_item(
                 *snapshot["items"],
                 item,
             ],
+            output_policy=snapshot["output_policy"],
             action_type="publish_item",
             item_id=item["item_id"],
             actor_type="admin_operator",
@@ -3845,6 +4412,7 @@ async def admin_update_site_hi_item(
             expected_revision=
                 snapshot["revision"],
             items=next_items,
+            output_policy=snapshot["output_policy"],
             action_type="edit_item",
             item_id=item_id,
             actor_type="admin_operator",
@@ -3917,6 +4485,7 @@ async def admin_clear_site_hi_item(
             expected_revision=
                 snapshot["revision"],
             items=next_items,
+            output_policy=snapshot["output_policy"],
             action_type="clear_item",
             item_id=item_id,
             actor_type="admin_operator",
@@ -3932,6 +4501,194 @@ async def admin_clear_site_hi_item(
                 "before": existing,
                 "reason": reason,
                 "resolution_claimed": False,
+            },
+            occurred_at=occurred_at,
+        )
+
+
+@app.put(
+    "/admin/sites/{site_id}/hi/board"
+)
+async def admin_update_site_hi_board(
+    site_id: str,
+    payload: SiteHiBoardMutationRequest,
+):
+    with get_db() as conn:
+        require_hi_mutation_site(conn, site_id)
+
+        snapshot = load_site_hi_snapshot(conn, site_id)
+        require_expected_hi_revision(
+            snapshot,
+            payload.expected_revision,
+        )
+
+        if len(payload.items) > 200:
+            raise HTTPException(
+                status_code=400,
+                detail="Site Board may contain at most 200 H&I items.",
+            )
+
+        existing_by_id = {
+            item["item_id"]: item
+            for item in snapshot["items"]
+        }
+        seen_item_ids = set()
+        next_items: List[Dict[str, Any]] = []
+
+        for requested in payload.items:
+            existing = None
+            if requested.item_id is not None:
+                item_id = requested.item_id.strip()
+                if not item_id.startswith("hi-"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Invalid H&I item_id in board payload.",
+                    )
+                if item_id in seen_item_ids:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Duplicate H&I item_id in board payload.",
+                    )
+                seen_item_ids.add(item_id)
+                existing = existing_by_id.get(item_id)
+                if existing is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"H&I board item {item_id} is not present "
+                            "in the current Site snapshot."
+                        ),
+                    )
+
+            next_items.append(
+                build_hi_board_item(
+                    conn,
+                    site_id,
+                    requested,
+                    existing=existing,
+                )
+            )
+
+        next_items = canonical_hi_items(next_items)
+        next_policy = normalise_hi_output_policy(
+            payload.output_policy.model_dump()
+            if hasattr(payload.output_policy, "model_dump")
+            else payload.output_policy.dict()
+        )
+
+        before_items = {item["item_id"]: item for item in snapshot["items"]}
+        after_items = {item["item_id"]: item for item in next_items}
+
+        added_items = [
+            item for item_id, item in after_items.items()
+            if item_id not in before_items
+        ]
+        removed_items = [
+            item for item_id, item in before_items.items()
+            if item_id not in after_items
+        ]
+        updated_items = []
+        for item_id, after in after_items.items():
+            before = before_items.get(item_id)
+            if before is not None and before != after:
+                updated_items.append({"before": before, "after": after})
+
+        policy_changed = next_policy != snapshot["output_policy"]
+        items_changed = bool(added_items or removed_items or updated_items)
+
+        if not policy_changed and not items_changed:
+            raise HTTPException(
+                status_code=400,
+                detail="H&I Site Board update contains no material change.",
+            )
+
+        if items_changed:
+            action_type = (
+                "publish_board"
+                if snapshot["revision"] == 0
+                else "update_board"
+            )
+        else:
+            action_type = "set_output_policy"
+
+        evidence_ids = aggregate_hi_evidence_ids(
+            added_items
+            + removed_items
+            + [pair["before"] for pair in updated_items]
+            + [pair["after"] for pair in updated_items]
+        )
+        occurred_at = utc_now_iso()
+
+        return persist_site_hi_revision(
+            conn,
+            site_id=site_id,
+            expected_revision=snapshot["revision"],
+            items=next_items,
+            output_policy=next_policy,
+            action_type=action_type,
+            item_id=None,
+            actor_type="admin_operator",
+            actor_ref=None,
+            source_type=(
+                "evidence_linked"
+                if evidence_ids
+                else "manual_operator"
+            ),
+            evidence_event_ids=evidence_ids,
+            action_payload={
+                "before_output_policy": snapshot["output_policy"],
+                "after_output_policy": next_policy,
+                "added_items": added_items,
+                "updated_items": updated_items,
+                "removed_items": removed_items,
+            },
+            occurred_at=occurred_at,
+        )
+
+
+@app.put(
+    "/admin/sites/{site_id}/hi/output-policy"
+)
+async def admin_update_site_hi_output_policy(
+    site_id: str,
+    payload: SiteHiOutputPolicyMutationRequest,
+):
+    with get_db() as conn:
+        require_hi_mutation_site(conn, site_id)
+        snapshot = load_site_hi_snapshot(conn, site_id)
+        require_expected_hi_revision(
+            snapshot,
+            payload.expected_revision,
+        )
+
+        next_policy = normalise_hi_output_policy(
+            payload.output_policy.model_dump()
+            if hasattr(payload.output_policy, "model_dump")
+            else payload.output_policy.dict()
+        )
+
+        if next_policy == snapshot["output_policy"]:
+            raise HTTPException(
+                status_code=400,
+                detail="H&I output policy contains no material change.",
+            )
+
+        occurred_at = utc_now_iso()
+        return persist_site_hi_revision(
+            conn,
+            site_id=site_id,
+            expected_revision=snapshot["revision"],
+            items=snapshot["items"],
+            output_policy=next_policy,
+            action_type="set_output_policy",
+            item_id=None,
+            actor_type="admin_operator",
+            actor_ref=None,
+            source_type="manual_operator",
+            evidence_event_ids=[],
+            action_payload={
+                "before_output_policy": snapshot["output_policy"],
+                "after_output_policy": next_policy,
             },
             occurred_at=occurred_at,
         )
@@ -4231,10 +4988,23 @@ async def api_kiosk_hi(
             kiosk_id,
         )
 
-        return load_site_hi_snapshot(
+        snapshot = load_site_hi_snapshot(
             conn,
             site_id,
         )
+
+        # HI.4C.1 transition safety: output policy is Backend
+        # authority before the calibrated Kiosk renderer lands.
+        # A disabled Kiosk profile must not receive ordinary H&I
+        # items from an older HI.4 client that does not yet inspect
+        # output_policy. The Site Board remains fully persisted.
+        if not snapshot["output_policy"]["kiosk_hi_module_enabled"]:
+            return {
+                **snapshot,
+                "items": [],
+            }
+
+        return snapshot
 
 
 @app.post("/api/signin")
