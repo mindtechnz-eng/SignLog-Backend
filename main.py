@@ -456,6 +456,77 @@ def ensure_site_hi_schema(
         """,
     )
 
+    # HI.4C.4-A: renderer delivery truth is deliberately
+    # separate from Site H&I material revisions/actions.
+    if DB_MODE == "postgres":
+        execute_write(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS site_hi_delivery_receipts (
+                id SERIAL PRIMARY KEY,
+                site_id TEXT NOT NULL,
+                renderer_type TEXT NOT NULL,
+                renderer_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                confirmed_at TEXT NOT NULL,
+                FOREIGN KEY(site_id)
+                    REFERENCES sites(site_id)
+            )
+            """,
+        )
+    else:
+        execute_write(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS site_hi_delivery_receipts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                site_id TEXT NOT NULL,
+                renderer_type TEXT NOT NULL,
+                renderer_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                confirmed_at TEXT NOT NULL,
+                FOREIGN KEY(site_id)
+                    REFERENCES sites(site_id)
+            )
+            """,
+        )
+
+    execute_write(
+        conn,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS
+            uq_site_hi_delivery_site_renderer_revision
+        ON site_hi_delivery_receipts(
+            site_id,
+            renderer_type,
+            renderer_id,
+            revision
+        )
+        """,
+    )
+
+    execute_write(
+        conn,
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_site_hi_delivery_site_id
+        ON site_hi_delivery_receipts(site_id)
+        """,
+    )
+
+    execute_write(
+        conn,
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_site_hi_delivery_site_time_id
+        ON site_hi_delivery_receipts(
+            site_id,
+            confirmed_at,
+            id
+        )
+        """,
+    )
+
 
 # =========================================================
 # Database Init
@@ -869,6 +940,11 @@ class SiteHiBoardMutationRequest(BaseModel):
 class SiteHiOutputPolicyMutationRequest(BaseModel):
     expected_revision: int = Field(ge=0)
     output_policy: SiteHiOutputPolicyRequest
+
+
+class SiteHiDeliveryReceiptRequest(BaseModel):
+    site_id: str = Field(min_length=1)
+    revision: int = Field(ge=1)
 
 
 class SiteHiClearRequest(BaseModel):
@@ -1498,6 +1574,11 @@ HI_ACTION_SOURCE_TYPES = {
     "manual_operator",
     "evidence_linked",
     "system_expiry",
+}
+
+HI_RENDERER_TYPES = {
+    "kiosk",
+    "digital_board",
 }
 
 
@@ -3217,6 +3298,223 @@ def site_hi_action_from_row(
     }
 
 
+def site_hi_delivery_receipt_from_row(
+    site_id: str,
+    row: Dict[str, Any],
+) -> Dict[str, Any]:
+    receipt_id = row.get("id")
+    renderer_type = row.get("renderer_type")
+    renderer_id = row.get("renderer_id")
+    revision = row.get("revision")
+    confirmed_at = row.get("confirmed_at")
+
+    if (
+        not isinstance(receipt_id, int)
+        or isinstance(receipt_id, bool)
+        or receipt_id < 1
+    ):
+        raise hi_integrity_error(
+            site_id,
+            "delivery receipt contains invalid receipt ID.",
+        )
+
+    if row.get("site_id") != site_id:
+        raise hi_integrity_error(
+            site_id,
+            "delivery receipt Site identity does not match row.",
+        )
+
+    if renderer_type not in HI_RENDERER_TYPES:
+        raise hi_integrity_error(
+            site_id,
+            "delivery receipt contains unknown renderer_type.",
+        )
+
+    if (
+        not isinstance(renderer_id, str)
+        or not renderer_id.strip()
+    ):
+        raise hi_integrity_error(
+            site_id,
+            "delivery receipt contains invalid renderer_id.",
+        )
+
+    if (
+        not isinstance(revision, int)
+        or isinstance(revision, bool)
+        or revision < 1
+    ):
+        raise hi_integrity_error(
+            site_id,
+            "delivery receipt contains invalid revision.",
+        )
+
+    parse_hi_datetime(
+        confirmed_at,
+        field_name="confirmed_at",
+        site_id=site_id,
+        storage=True,
+    )
+
+    return {
+        "id": receipt_id,
+        "site_id": site_id,
+        "renderer_type": renderer_type,
+        "renderer_id": renderer_id,
+        "revision": revision,
+        "confirmed_at": confirmed_at,
+    }
+
+
+def load_site_hi_revision_snapshot_for_delivery(
+    conn: Connection,
+    site_id: str,
+    revision: int,
+) -> Dict[str, Any]:
+    """
+    Resolve the exact H&I revision a renderer claims to have
+    presented without materialising expiry or mutating H&I.
+
+    A recently rendered older revision remains confirmable from
+    the immutable Site H&I action trail if Admin published a newer
+    revision before the receipt arrived.
+    """
+    current = load_site_hi_snapshot_raw(
+        conn,
+        site_id,
+    )
+
+    if current["revision"] == revision:
+        return current
+
+    row = fetch_one(
+        conn,
+        """
+        SELECT
+            id,
+            site_id,
+            revision,
+            action_type,
+            item_id,
+            actor_type,
+            actor_ref,
+            source_type,
+            evidence_event_ids_json,
+            action_payload_json,
+            snapshot_json,
+            occurred_at
+        FROM site_hi_actions
+        WHERE site_id = :site_id
+          AND revision = :revision
+        LIMIT 1
+        """,
+        {
+            "site_id": site_id,
+            "revision": revision,
+        },
+    )
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="H&I revision not found for this Site.",
+        )
+
+    return site_hi_action_from_row(
+        site_id,
+        row,
+    )["snapshot"]
+
+
+def persist_site_hi_delivery_receipt(
+    conn: Connection,
+    *,
+    site_id: str,
+    renderer_type: str,
+    renderer_id: str,
+    revision: int,
+) -> Dict[str, Any]:
+    if renderer_type not in HI_RENDERER_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported H&I renderer_type.",
+        )
+
+    confirmed_at = utc_now_iso()
+
+    # PostgreSQL and current SQLite both support this conflict
+    # form. The unique tuple makes renderer confirmation
+    # idempotent across polling and Kiosk restarts.
+    execute_write(
+        conn,
+        """
+        INSERT INTO site_hi_delivery_receipts (
+            site_id,
+            renderer_type,
+            renderer_id,
+            revision,
+            confirmed_at
+        )
+        VALUES (
+            :site_id,
+            :renderer_type,
+            :renderer_id,
+            :revision,
+            :confirmed_at
+        )
+        ON CONFLICT (
+            site_id,
+            renderer_type,
+            renderer_id,
+            revision
+        ) DO NOTHING
+        """,
+        {
+            "site_id": site_id,
+            "renderer_type": renderer_type,
+            "renderer_id": renderer_id,
+            "revision": revision,
+            "confirmed_at": confirmed_at,
+        },
+    )
+
+    row = fetch_one(
+        conn,
+        """
+        SELECT
+            id,
+            site_id,
+            renderer_type,
+            renderer_id,
+            revision,
+            confirmed_at
+        FROM site_hi_delivery_receipts
+        WHERE site_id = :site_id
+          AND renderer_type = :renderer_type
+          AND renderer_id = :renderer_id
+          AND revision = :revision
+        LIMIT 1
+        """,
+        {
+            "site_id": site_id,
+            "renderer_type": renderer_type,
+            "renderer_id": renderer_id,
+            "revision": revision,
+        },
+    )
+
+    if not row:
+        raise HTTPException(
+            status_code=500,
+            detail="H&I delivery receipt could not be persisted.",
+        )
+
+    return site_hi_delivery_receipt_from_row(
+        site_id,
+        row,
+    )
+
+
 def resolve_kiosk_hi_site_id(
     conn: Connection,
     kiosk_id: str,
@@ -4298,6 +4596,70 @@ async def admin_site_hi_actions(
         ]
 
 
+@app.get(
+    "/admin/sites/{site_id}/hi/delivery-receipts"
+)
+async def admin_site_hi_delivery_receipts(
+    site_id: str,
+    limit: int = Query(
+        default=100,
+        ge=1,
+        le=500,
+    ),
+    before_id: Optional[int] = Query(
+        default=None,
+        ge=1,
+    ),
+):
+    with get_db() as conn:
+        # Delivery history belongs to the Site and remains
+        # readable after archive/release.
+        require_hi_site(
+            conn,
+            site_id,
+        )
+
+        clauses = [
+            "site_id = :site_id"
+        ]
+        params: Dict[str, Any] = {
+            "site_id": site_id,
+            "limit": limit,
+        }
+
+        if before_id is not None:
+            clauses.append(
+                "id < :before_id"
+            )
+            params["before_id"] = before_id
+
+        rows = fetch_all(
+            conn,
+            f"""
+            SELECT
+                id,
+                site_id,
+                renderer_type,
+                renderer_id,
+                revision,
+                confirmed_at
+            FROM site_hi_delivery_receipts
+            WHERE {' AND '.join(clauses)}
+            ORDER BY id DESC
+            LIMIT :limit
+            """,
+            params,
+        )
+
+        return [
+            site_hi_delivery_receipt_from_row(
+                site_id,
+                row,
+            )
+            for row in rows
+        ]
+
+
 @app.post(
     "/admin/sites/{site_id}/hi/items"
 )
@@ -5007,6 +5369,71 @@ async def api_kiosk_hi(
         return snapshot
 
 
+@app.post(
+    "/api/kiosks/{kiosk_id}/hi/delivery-receipts"
+)
+async def api_kiosk_hi_delivery_receipt(
+    kiosk_id: str,
+    payload: SiteHiDeliveryReceiptRequest,
+):
+    with get_db() as conn:
+        current_site_id = resolve_kiosk_hi_site_id(
+            conn,
+            kiosk_id,
+        )
+
+        requested_site_id = (
+            payload.site_id or ""
+        ).strip()
+
+        if not requested_site_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid Site identity in H&I delivery receipt.",
+            )
+
+        # Explicit Site correspondence closes the in-flight
+        # rebind race: an old-Site render can never be credited
+        # to whichever Site now owns this Kiosk identity.
+        if requested_site_id != current_site_id:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "H&I delivery receipt Site does not match "
+                    "the Kiosk's current active binding."
+                ),
+            )
+
+        snapshot = (
+            load_site_hi_revision_snapshot_for_delivery(
+                conn,
+                current_site_id,
+                payload.revision,
+            )
+        )
+
+        if not snapshot["output_policy"]["kiosk_hi_module_enabled"]:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Kiosk H&I output was disabled for the "
+                    "acknowledged revision."
+                ),
+            )
+
+        renderer_id = (
+            kiosk_id or ""
+        ).strip()
+
+        return persist_site_hi_delivery_receipt(
+            conn,
+            site_id=current_site_id,
+            renderer_type="kiosk",
+            renderer_id=renderer_id,
+            revision=payload.revision,
+        )
+
+
 @app.post("/api/signin")
 async def api_signin(
     payload: SignEventRequest,
@@ -5262,8 +5689,3 @@ async def api_full_headcount(
             "site_id": site_id,
             **state,
         }
-
-
-
-
-
