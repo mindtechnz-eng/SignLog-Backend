@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from contextlib import contextmanager
@@ -1258,6 +1259,53 @@ class SiteAiGenerateSuggestionRequest(BaseModel):
 
 
 # =========================================================
+# AIA.4 - Human Decision Request Models
+# =========================================================
+
+SiteAiDecisionType = Literal[
+    "confirmed",
+    "edited_confirmed",
+    "dismissed",
+]
+
+
+class SiteAiFinalHiPayloadRequest(BaseModel):
+    # These two fields are intentionally literals. The human may edit
+    # presentation wording/order/expiry, but cannot turn one AIA Site
+    # Hazard proposal into a different H&I authority class.
+    category: Literal["current_hazard"]
+    section_key: Literal["site_hazards"]
+    section_data: Dict[str, Any] = Field(
+        default_factory=dict
+    )
+
+    title: str = Field(
+        min_length=1,
+        max_length=120,
+    )
+    message: str = Field(
+        min_length=1,
+        max_length=1500,
+    )
+    display_order: int = Field(
+        ge=0,
+        le=999,
+    )
+    valid_until: Optional[str] = None
+
+
+class SiteAiDecisionRequest(BaseModel):
+    decision: SiteAiDecisionType
+    expected_hi_revision: Optional[int] = Field(
+        default=None,
+        ge=0,
+    )
+    final_hi_payload: Optional[
+        SiteAiFinalHiPayloadRequest
+    ] = None
+
+
+# =========================================================
 # H&I Mutation Models (HI.2)
 # =========================================================
 
@@ -1952,6 +2000,7 @@ HI_DEFAULT_OUTPUT_POLICY = {
 HI_ITEM_SOURCE_TYPES = {
     "manual_operator",
     "evidence_linked",
+    "ai_assisted_confirmed",
 }
 
 HI_ACTION_TYPES = {
@@ -1979,6 +2028,7 @@ HI_ACTION_ACTOR_TYPES = {
 HI_ACTION_SOURCE_TYPES = {
     "manual_operator",
     "evidence_linked",
+    "ai_assisted_confirmed",
     "system_expiry",
 }
 
@@ -2838,6 +2888,7 @@ def build_hi_item_from_payload(
     *,
     existing: Optional[Dict[str, Any]] = None,
     allow_no_change: bool = False,
+    source_type_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     title = payload.title.strip()
     message = payload.message.strip()
@@ -2902,11 +2953,22 @@ def build_hi_item_from_payload(
         evidence_event_ids,
     )
 
-    source_type = (
-        "evidence_linked"
-        if evidence_event_ids
-        else "manual_operator"
-    )
+    if source_type_override is not None:
+        if (
+            source_type_override
+            not in HI_ITEM_SOURCE_TYPES
+        ):
+            raise ValueError(
+                "Invalid internal H&I source_type override."
+            )
+
+        source_type = source_type_override
+    else:
+        source_type = (
+            "evidence_linked"
+            if evidence_event_ids
+            else "manual_operator"
+        )
 
     section_key = payload.section_key
     if section_key is None and existing:
@@ -8831,6 +8893,502 @@ def build_aia3_suggestion_summary(
 
 
 # =========================================================
+# AIA.4A - Human Decision + H&I Bridge
+# =========================================================
+
+AIA4_DECISION_CONTRACT_VERSION = "assistant-decision.v1"
+AIA4_HI_SOURCE_TYPE = "ai_assisted_confirmed"
+
+
+def aia4_canonical_json(
+    value: Any,
+) -> str:
+    """Stable canonical JSON used only for AIA proposal audit hashing."""
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def aia4_original_proposal_hash(
+    suggestion: Dict[str, Any],
+) -> Optional[str]:
+    proposal = suggestion.get(
+        "proposed_hi_payload"
+    )
+
+    if proposal is None:
+        return None
+
+    if not isinstance(proposal, dict):
+        raise aia_storage_integrity_error(
+            suggestion[
+                "site_id"
+            ],
+            "stored AIA proposal is not an object.",
+        )
+
+    return hashlib.sha256(
+        aia4_canonical_json(
+            proposal
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def aia4_require_pending_suggestion(
+    suggestion: Dict[str, Any],
+) -> None:
+    if suggestion.get(
+        "status"
+    ) != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "AI-ASSIST suggestion is no longer pending. "
+                "Refresh Assistant state before taking another decision."
+            ),
+        )
+
+
+def aia4_claim_pending_suggestion(
+    conn: Connection,
+    *,
+    site_id: str,
+    suggestion_id: str,
+    updated_at: str,
+) -> None:
+    """
+    Transaction-local final-decision claim.
+
+    The status transition is rolled back automatically if the H&I
+    deployment or decision write later fails inside this transaction.
+    """
+    result = execute_write(
+        conn,
+        """
+        UPDATE site_ai_suggestions
+        SET status = 'decided',
+            updated_at = :updated_at
+        WHERE site_id = :site_id
+          AND suggestion_id = :suggestion_id
+          AND status = 'pending'
+        """,
+        {
+            "site_id": site_id,
+            "suggestion_id":
+                suggestion_id,
+            "updated_at": updated_at,
+        },
+    )
+
+    if result.rowcount != 1:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "AI-ASSIST suggestion changed while the decision "
+                "was being prepared. Refresh Assistant state."
+            ),
+        )
+
+
+def aia4_insert_decision(
+    conn: Connection,
+    *,
+    site_id: str,
+    suggestion_id: str,
+    decision: str,
+    original_proposal_hash: Optional[str],
+    decision_payload: Dict[str, Any],
+    resulting_hi_revision: Optional[int],
+    failure_detail: Optional[str],
+    occurred_at: str,
+) -> Dict[str, Any]:
+    if decision not in AIA_DECISION_TYPES:
+        raise ValueError(
+            "Invalid internal AIA decision type."
+        )
+
+    execute_write(
+        conn,
+        """
+        INSERT INTO site_ai_decisions (
+            suggestion_id,
+            site_id,
+            actor_type,
+            actor_ref,
+            decision,
+            original_proposal_hash,
+            decision_payload_json,
+            resulting_hi_revision,
+            failure_detail,
+            occurred_at
+        )
+        VALUES (
+            :suggestion_id,
+            :site_id,
+            :actor_type,
+            :actor_ref,
+            :decision,
+            :original_proposal_hash,
+            :decision_payload_json,
+            :resulting_hi_revision,
+            :failure_detail,
+            :occurred_at
+        )
+        """,
+        {
+            "suggestion_id":
+                suggestion_id,
+            "site_id": site_id,
+            "actor_type":
+                "admin_operator",
+            "actor_ref": None,
+            "decision": decision,
+            "original_proposal_hash":
+                original_proposal_hash,
+            "decision_payload_json":
+                aia_json_dumps(
+                    decision_payload
+                ),
+            "resulting_hi_revision":
+                resulting_hi_revision,
+            "failure_detail":
+                failure_detail,
+            "occurred_at": occurred_at,
+        },
+    )
+
+    row = fetch_one(
+        conn,
+        """
+        SELECT
+            id,
+            suggestion_id,
+            site_id,
+            actor_type,
+            actor_ref,
+            decision,
+            original_proposal_hash,
+            decision_payload_json,
+            resulting_hi_revision,
+            failure_detail,
+            occurred_at
+        FROM site_ai_decisions
+        WHERE site_id = :site_id
+          AND suggestion_id = :suggestion_id
+          AND occurred_at = :occurred_at
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        {
+            "site_id": site_id,
+            "suggestion_id":
+                suggestion_id,
+            "occurred_at": occurred_at,
+        },
+    )
+
+    if row is None:
+        raise RuntimeError(
+            "AIA decision write could not be read back."
+        )
+
+    return aia3_decision_from_row(
+        site_id,
+        row,
+    )
+
+
+def aia4_current_review_state(
+    conn: Connection,
+    *,
+    site_id: str,
+    suggestion: Dict[str, Any],
+    site_operational_state: Optional[str],
+) -> Dict[str, Any]:
+    evidence = fetch_aia3_evidence_records(
+        conn,
+        site_id=site_id,
+        event_ids=suggestion[
+            "evidence_event_ids"
+        ],
+    )
+
+    current_hi_snapshot = (
+        load_site_hi_snapshot(
+            conn,
+            site_id,
+        )
+    )
+
+    current_subject_state = (
+        aia3_current_subject_state(
+            conn,
+            site_id=site_id,
+            suggestion=suggestion,
+        )
+    )
+
+    staleness = build_aia3_staleness(
+        suggestion=suggestion,
+        current_hi_snapshot=
+            current_hi_snapshot,
+        current_subject_state=
+            current_subject_state,
+        missing_event_ids=evidence[
+            "missing_event_ids"
+        ],
+        site_operational_state=
+            site_operational_state,
+    )
+
+    return {
+        "current_hi_snapshot":
+            current_hi_snapshot,
+        "staleness": staleness,
+    }
+
+
+def aia4_stored_proposal_payload(
+    suggestion: Dict[str, Any],
+) -> Dict[str, Any]:
+    site_id = suggestion[
+        "site_id"
+    ]
+
+    if suggestion.get(
+        "suggestion_type"
+    ) != "publish_site_hazard":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This AI-ASSIST review does not contain a publishable "
+                "Site Hazard proposal."
+            ),
+        )
+
+    proposal = suggestion.get(
+        "proposed_hi_payload"
+    )
+
+    if not isinstance(
+        proposal,
+        dict,
+    ):
+        raise aia_storage_integrity_error(
+            site_id,
+            "publish_site_hazard suggestion has no stored H&I proposal.",
+        )
+
+    if (
+        proposal.get("category")
+        != "current_hazard"
+        or proposal.get(
+            "section_key"
+        ) != "site_hazards"
+    ):
+        raise aia_storage_integrity_error(
+            site_id,
+            "stored AIA H&I proposal has invalid category/section authority.",
+        )
+
+    return proposal
+
+
+def aia4_final_hi_payload(
+    *,
+    suggestion: Dict[str, Any],
+    decision: str,
+    edited_payload: Optional[
+        SiteAiFinalHiPayloadRequest
+    ],
+) -> Dict[str, Any]:
+    proposal = aia4_stored_proposal_payload(
+        suggestion
+    )
+
+    if decision == "confirmed":
+        if edited_payload is not None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Confirm & Deploy uses the stored AIA proposal as-is. "
+                    "Use edited_confirmed to submit human-edited wording."
+                ),
+            )
+
+        source = proposal
+    elif decision == "edited_confirmed":
+        if edited_payload is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Edit + Confirm requires final_hi_payload."
+                ),
+            )
+
+        source = (
+            edited_payload.model_dump()
+            if hasattr(
+                edited_payload,
+                "model_dump",
+            )
+            else edited_payload.dict()
+        )
+    else:
+        raise ValueError(
+            "AIA H&I payload requested for a non-deploy decision."
+        )
+
+    # Evidence provenance is never client-editable. The complete
+    # suggestion evidence set is the controlled deployment basis.
+    return {
+        "category":
+            "current_hazard",
+        "section_key":
+            "site_hazards",
+        "section_data":
+            source.get(
+                "section_data",
+                {},
+            ),
+        "title": source.get(
+            "title"
+        ),
+        "message": source.get(
+            "message"
+        ),
+        "display_order":
+            source.get(
+                "display_order"
+            ),
+        "valid_until":
+            source.get(
+                "valid_until"
+            ),
+        "evidence_event_ids":
+            list(
+                suggestion[
+                    "evidence_event_ids"
+                ]
+            ),
+    }
+
+
+def aia4_hi_mutation_request(
+    *,
+    expected_revision: int,
+    final_payload: Dict[str, Any],
+) -> SiteHiItemMutationRequest:
+    try:
+        return SiteHiItemMutationRequest(
+            expected_revision=
+                expected_revision,
+            category=
+                "current_hazard",
+            section_key=
+                "site_hazards",
+            section_data=
+                final_payload.get(
+                    "section_data",
+                    {},
+                ),
+            title=
+                final_payload.get(
+                    "title"
+                ),
+            message=
+                final_payload.get(
+                    "message"
+                ),
+            display_order=
+                final_payload.get(
+                    "display_order"
+                ),
+            valid_until=
+                final_payload.get(
+                    "valid_until"
+                ),
+            evidence_event_ids=
+                final_payload[
+                    "evidence_event_ids"
+                ],
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Final H&I payload is not valid for the normal "
+                "Site Hazard publication contract."
+            ),
+        ) from exc
+
+
+def aia4_bounded_failure_detail(
+    detail: Any,
+) -> str:
+    value = (
+        detail
+        if isinstance(detail, str)
+        else "H&I deployment failed."
+    )
+    return value[:500]
+
+
+def aia4_record_failed_deploy_attempt(
+    *,
+    site_id: str,
+    suggestion_id: str,
+    decision: str,
+    original_proposal_hash: Optional[str],
+    decision_payload: Dict[str, Any],
+    failure_detail: str,
+) -> None:
+    """
+    Best-effort audit write after the deployment transaction rolled back.
+
+    A failed human-authorised deploy never closes the suggestion and never
+    creates an H&I revision. If another final decision won the race, no
+    failed-attempt row is added after that terminal outcome.
+    """
+    try:
+        with get_db() as conn:
+            suggestion = fetch_aia3_suggestion(
+                conn,
+                site_id=site_id,
+                suggestion_id=
+                    suggestion_id,
+            )
+
+            if suggestion.get(
+                "status"
+            ) != "pending":
+                return
+
+            aia4_insert_decision(
+                conn,
+                site_id=site_id,
+                suggestion_id=
+                    suggestion_id,
+                decision=decision,
+                original_proposal_hash=
+                    original_proposal_hash,
+                decision_payload=
+                    decision_payload,
+                resulting_hi_revision=None,
+                failure_detail=
+                    failure_detail,
+                occurred_at=utc_now_iso(),
+            )
+    except Exception:
+        # The original deployment error is the operator-facing failure.
+        # Audit persistence failure must not disguise it.
+        return
+
+
+# =========================================================
 # Health
 # =========================================================
 
@@ -10986,6 +11544,394 @@ async def admin_site_ai_suggestion_detail(
             "decisions": decisions,
             "retrieved_at": utc_now_iso(),
         }
+
+
+# =========================================================
+# AIA.4A - Admin Human Decision + H&I Bridge
+# =========================================================
+
+@app.post(
+    "/admin/sites/{site_id}/ai/suggestions/{suggestion_id}/decision"
+)
+async def admin_site_ai_suggestion_decision(
+    site_id: str,
+    suggestion_id: str,
+    payload: SiteAiDecisionRequest,
+):
+    """
+    Persist one explicit human Assistant decision.
+
+    Dismiss creates AIA audit truth only. Confirm/Edit+Confirm may publish
+    one normal H&I Site Hazard revision, but only after current Backend
+    staleness/revision checks. No client may supply H&I source authority or
+    rewrite the suggestion evidence basis.
+    """
+    deployment_attempted = False
+    failure_context: Optional[
+        Dict[str, Any]
+    ] = None
+
+    try:
+        with get_db() as conn:
+            site = require_aia_site(
+                conn,
+                site_id,
+            )
+
+            suggestion = fetch_aia3_suggestion(
+                conn,
+                site_id=site_id,
+                suggestion_id=
+                    suggestion_id,
+            )
+
+            aia4_require_pending_suggestion(
+                suggestion
+            )
+
+            original_proposal_hash = (
+                aia4_original_proposal_hash(
+                    suggestion
+                )
+            )
+
+            if payload.decision == "dismissed":
+                if (
+                    payload.expected_hi_revision
+                    is not None
+                    or payload.final_hi_payload
+                    is not None
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Dismiss does not accept an H&I revision or "
+                            "final H&I payload."
+                        ),
+                    )
+
+                occurred_at = utc_now_iso()
+
+                aia4_claim_pending_suggestion(
+                    conn,
+                    site_id=site_id,
+                    suggestion_id=
+                        suggestion_id,
+                    updated_at=occurred_at,
+                )
+
+                decision_record = (
+                    aia4_insert_decision(
+                        conn,
+                        site_id=site_id,
+                        suggestion_id=
+                            suggestion_id,
+                        decision="dismissed",
+                        original_proposal_hash=
+                            original_proposal_hash,
+                        decision_payload={
+                            "dismissed": True,
+                        },
+                        resulting_hi_revision=None,
+                        failure_detail=None,
+                        occurred_at=occurred_at,
+                    )
+                )
+
+                return {
+                    "contract_version":
+                        AIA4_DECISION_CONTRACT_VERSION,
+                    "site_id": site_id,
+                    "suggestion_id":
+                        suggestion_id,
+                    "decision":
+                        "dismissed",
+                    "suggestion_status":
+                        "decided",
+                    "resulting_hi_revision":
+                        None,
+                    "decision_record":
+                        decision_record,
+                    "hi_snapshot": None,
+                }
+
+            # Confirm/Edit+Confirm are H&I publication decisions.
+            require_hi_mutation_site(
+                conn,
+                site_id,
+            )
+
+            if payload.expected_hi_revision is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Confirm & Deploy requires expected_hi_revision."
+                    ),
+                )
+
+            review_state = (
+                aia4_current_review_state(
+                    conn,
+                    site_id=site_id,
+                    suggestion=suggestion,
+                    site_operational_state=
+                        site.get(
+                            "operational_state"
+                        ),
+                )
+            )
+
+            current_hi_snapshot = (
+                review_state[
+                    "current_hi_snapshot"
+                ]
+            )
+            staleness = review_state[
+                "staleness"
+            ]
+
+            if (
+                staleness[
+                    "stale"
+                ]
+                or not staleness[
+                    "actionable"
+                ]
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "AI-ASSIST review is stale or no longer actionable. "
+                        "Refresh analysis before confirmation."
+                    ),
+                )
+
+            if (
+                payload.expected_hi_revision
+                != current_hi_snapshot[
+                    "revision"
+                ]
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "H&I revision conflict. Refresh current Site H&I "
+                        "and the Assistant review before confirmation."
+                    ),
+                )
+
+            final_payload = (
+                aia4_final_hi_payload(
+                    suggestion=suggestion,
+                    decision=
+                        payload.decision,
+                    edited_payload=
+                        payload.final_hi_payload,
+                )
+            )
+
+            mutation = (
+                aia4_hi_mutation_request(
+                    expected_revision=
+                        current_hi_snapshot[
+                            "revision"
+                        ],
+                    final_payload=
+                        final_payload,
+                )
+            )
+
+            # Reuse normal H&I validation and evidence-reference checks.
+            item = build_hi_item_from_payload(
+                conn,
+                site_id,
+                mutation,
+                source_type_override=
+                    AIA4_HI_SOURCE_TYPE,
+            )
+
+            decision_payload = {
+                "final_hi_payload": {
+                    "category":
+                        final_payload[
+                            "category"
+                        ],
+                    "section_key":
+                        final_payload[
+                            "section_key"
+                        ],
+                    "section_data":
+                        final_payload[
+                            "section_data"
+                        ],
+                    "title":
+                        item[
+                            "title"
+                        ],
+                    "message":
+                        item[
+                            "message"
+                        ],
+                    "display_order":
+                        item[
+                            "display_order"
+                        ],
+                    "valid_until":
+                        item[
+                            "valid_until"
+                        ],
+                    "evidence_event_ids":
+                        list(
+                            item[
+                                "evidence_event_ids"
+                            ]
+                        ),
+                }
+            }
+
+            occurred_at = item[
+                "updated_at"
+            ]
+
+            # Claim final-decision ownership inside the same transaction.
+            # Any later failure rolls this transition back to pending.
+            aia4_claim_pending_suggestion(
+                conn,
+                site_id=site_id,
+                suggestion_id=
+                    suggestion_id,
+                updated_at=occurred_at,
+            )
+
+            failure_context = {
+                "decision":
+                    payload.decision,
+                "original_proposal_hash":
+                    original_proposal_hash,
+                "decision_payload":
+                    decision_payload,
+            }
+            deployment_attempted = True
+
+            hi_snapshot = (
+                persist_site_hi_revision(
+                    conn,
+                    site_id=site_id,
+                    expected_revision=
+                        current_hi_snapshot[
+                            "revision"
+                        ],
+                    items=[
+                        *current_hi_snapshot[
+                            "items"
+                        ],
+                        item,
+                    ],
+                    output_policy=
+                        current_hi_snapshot[
+                            "output_policy"
+                        ],
+                    action_type=
+                        "publish_item",
+                    item_id=
+                        item[
+                            "item_id"
+                        ],
+                    actor_type=
+                        "admin_operator",
+                    actor_ref=None,
+                    source_type=
+                        AIA4_HI_SOURCE_TYPE,
+                    evidence_event_ids=
+                        list(
+                            item[
+                                "evidence_event_ids"
+                            ]
+                        ),
+                    action_payload={
+                        "after": item,
+                        "aia_suggestion_id":
+                            suggestion_id,
+                        "aia_decision":
+                            payload.decision,
+                        "original_proposal_hash":
+                            original_proposal_hash,
+                    },
+                    occurred_at=occurred_at,
+                )
+            )
+
+            decision_record = (
+                aia4_insert_decision(
+                    conn,
+                    site_id=site_id,
+                    suggestion_id=
+                        suggestion_id,
+                    decision=
+                        payload.decision,
+                    original_proposal_hash=
+                        original_proposal_hash,
+                    decision_payload=
+                        decision_payload,
+                    resulting_hi_revision=
+                        hi_snapshot[
+                            "revision"
+                        ],
+                    failure_detail=None,
+                    occurred_at=occurred_at,
+                )
+            )
+
+            return {
+                "contract_version":
+                    AIA4_DECISION_CONTRACT_VERSION,
+                "site_id": site_id,
+                "suggestion_id":
+                    suggestion_id,
+                "decision":
+                    payload.decision,
+                "suggestion_status":
+                    "decided",
+                "resulting_hi_revision":
+                    hi_snapshot[
+                        "revision"
+                    ],
+                "decision_record":
+                    decision_record,
+                "hi_snapshot": hi_snapshot,
+            }
+
+    except HTTPException as exc:
+        if (
+            deployment_attempted
+            and failure_context
+            is not None
+        ):
+            aia4_record_failed_deploy_attempt(
+                site_id=site_id,
+                suggestion_id=
+                    suggestion_id,
+                decision=
+                    str(
+                        failure_context[
+                            "decision"
+                        ]
+                    ),
+                original_proposal_hash=
+                    failure_context[
+                        "original_proposal_hash"
+                    ],
+                decision_payload=
+                    failure_context[
+                        "decision_payload"
+                    ],
+                failure_detail=
+                    aia4_bounded_failure_detail(
+                        exc.detail
+                    ),
+            )
+
+        raise
 
 
 # =========================================================
