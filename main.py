@@ -4814,6 +4814,1483 @@ def build_aia_history_scope(
 
 
 # =========================================================
+# AIA.1C - H&I Coverage + Deterministic Candidate Gate
+# =========================================================
+
+AIA_CANDIDATE_CONTRACT_VERSION = "candidate-analysis.v1"
+
+AIA_RECURRENCE_MIN_SUPPORT = aia_positive_int_env(
+    "AIA_RECURRENCE_MIN_SUPPORT",
+    2,
+)
+
+AIA_HI_ACTION_CONTEXT_LIMIT = aia_positive_int_env(
+    "AIA_HI_ACTION_CONTEXT_LIMIT",
+    500,
+)
+
+AIA_PRIOR_SUGGESTION_SCAN_LIMIT = aia_positive_int_env(
+    "AIA_PRIOR_SUGGESTION_SCAN_LIMIT",
+    1000,
+)
+
+AIA_PRIOR_DECISION_SCAN_LIMIT = aia_positive_int_env(
+    "AIA_PRIOR_DECISION_SCAN_LIMIT",
+    5000,
+)
+
+
+def aia_storage_integrity_error(
+    site_id: str,
+    reason: str,
+) -> HTTPException:
+    return HTTPException(
+        status_code=500,
+        detail=(
+            "AI-ASSIST storage integrity error for "
+            f"Site {site_id}: {reason}"
+        ),
+    )
+
+
+def parse_aia_storage_json(
+    site_id: str,
+    field_name: str,
+    value: Optional[str],
+    expected_type: type,
+) -> Any:
+    if value is None:
+        raise aia_storage_integrity_error(
+            site_id,
+            f"{field_name} is missing.",
+        )
+
+    try:
+        decoded = json.loads(value)
+    except Exception as error:
+        raise aia_storage_integrity_error(
+            site_id,
+            f"{field_name} is not valid JSON.",
+        ) from error
+
+    if not isinstance(
+        decoded,
+        expected_type,
+    ):
+        raise aia_storage_integrity_error(
+            site_id,
+            f"{field_name} has the wrong JSON shape.",
+        )
+
+    return decoded
+
+
+def normalise_aia_stored_event_ids(
+    site_id: str,
+    field_name: str,
+    value: Any,
+) -> List[int]:
+    if not isinstance(
+        value,
+        list,
+    ):
+        raise aia_storage_integrity_error(
+            site_id,
+            f"{field_name} must contain an array.",
+        )
+
+    result: List[int] = []
+    seen = set()
+
+    for event_id in value:
+        if (
+            not isinstance(
+                event_id,
+                int,
+            )
+            or isinstance(
+                event_id,
+                bool,
+            )
+            or event_id < 1
+        ):
+            raise aia_storage_integrity_error(
+                site_id,
+                f"{field_name} contains an invalid event ID.",
+            )
+
+        if event_id in seen:
+            raise aia_storage_integrity_error(
+                site_id,
+                f"{field_name} contains duplicate event IDs.",
+            )
+
+        seen.add(
+            event_id
+        )
+        result.append(
+            event_id
+        )
+
+    return result
+
+
+def aia_subject_identity_key(
+    subject_code: Any,
+    subject_custom: Any = None,
+) -> Optional[str]:
+    if not isinstance(
+        subject_code,
+        str,
+    ):
+        return None
+
+    clean_code = (
+        subject_code
+        .strip()
+        .lower()
+    )
+
+    if (
+        clean_code
+        not in AIA0_EVIDENCE_SUBJECT_CODES
+    ):
+        return None
+
+    if clean_code != "other":
+        return clean_code
+
+    custom_key = (
+        normalise_aia_subject_custom_key(
+            subject_custom
+        )
+    )
+
+    if custom_key is None:
+        return None
+
+    return (
+        f"other::{custom_key}"
+    )
+
+
+def aia_hi_item_subject_codes(
+    item: Dict[str, Any],
+) -> List[str]:
+    """
+    Read exact non-visible H&I semantic metadata when a later
+    H&I schema permits it.
+
+    Current H&I v2 does not yet author these fields, so this is
+    a forward-compatible reader only and does not alter H&I.
+    """
+    section_data = item.get(
+        "section_data"
+    )
+
+    if not isinstance(
+        section_data,
+        dict,
+    ):
+        return []
+
+    values: List[str] = []
+
+    direct = section_data.get(
+        "subject_code"
+    )
+
+    if isinstance(
+        direct,
+        str,
+    ):
+        values.append(
+            direct
+        )
+
+    related = section_data.get(
+        "related_subject_codes"
+    )
+
+    if isinstance(
+        related,
+        list,
+    ):
+        values.extend(
+            value
+            for value in related
+            if isinstance(
+                value,
+                str,
+            )
+        )
+
+    result: List[str] = []
+    seen = set()
+
+    for value in values:
+        cleaned = (
+            value
+            .strip()
+            .lower()
+        )
+
+        if (
+            cleaned
+            not in AIA0_EVIDENCE_SUBJECT_CODES
+            or cleaned in seen
+        ):
+            continue
+
+        seen.add(
+            cleaned
+        )
+        result.append(
+            cleaned
+        )
+
+    return result
+
+
+def aia_hi_item_summary(
+    item: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "item_id":
+            item.get(
+                "item_id"
+            ),
+        "category":
+            item.get(
+                "category"
+            ),
+        "section_key":
+            item.get(
+                "section_key"
+            ),
+        "title":
+            item.get(
+                "title"
+            ),
+        "message":
+            item.get(
+                "message"
+            ),
+        "evidence_event_ids":
+            list(
+                item.get(
+                    "evidence_event_ids",
+                    [],
+                )
+            ),
+        "subject_codes":
+            aia_hi_item_subject_codes(
+                item
+            ),
+    }
+
+
+def aia_hi_snapshot_summary(
+    snapshot: Dict[str, Any],
+) -> Dict[str, Any]:
+    compared_items = [
+        aia_hi_item_summary(
+            item
+        )
+        for item in snapshot[
+            "items"
+        ]
+        if item.get(
+            "section_key"
+        )
+        in {
+            "site_hazards",
+            "ppe",
+        }
+    ]
+
+    return {
+        "revision":
+            snapshot[
+                "revision"
+            ],
+        "published_at":
+            snapshot.get(
+                "published_at"
+            ),
+        "compared_item_count":
+            len(
+                compared_items
+            ),
+        "current_hazard_count":
+            sum(
+                1
+                for item
+                in compared_items
+                if item[
+                    "section_key"
+                ]
+                == "site_hazards"
+            ),
+        "ppe_item_count":
+            sum(
+                1
+                for item
+                in compared_items
+                if item[
+                    "section_key"
+                ]
+                == "ppe"
+            ),
+        "items":
+            compared_items,
+    }
+
+
+def build_aia_hi_coverage(
+    *,
+    pulse: Dict[str, Any],
+    hi_snapshot: Dict[str, Any],
+    history_complete: bool,
+) -> Dict[str, Any]:
+    pulse_ids = set(
+        pulse[
+            "event_ids"
+        ]
+    )
+
+    subject_code = pulse[
+        "subject_code"
+    ]
+
+    compared_hi_item_ids: List[str] = []
+    matched_hi_item_ids: List[str] = []
+    context_hi_item_ids: List[str] = []
+    match_basis = set()
+
+    for item in hi_snapshot[
+        "items"
+    ]:
+        section_key = item.get(
+            "section_key"
+        )
+
+        if section_key not in {
+            "site_hazards",
+            "ppe",
+        }:
+            continue
+
+        item_id = item.get(
+            "item_id"
+        )
+
+        if isinstance(
+            item_id,
+            str,
+        ):
+            compared_hi_item_ids.append(
+                item_id
+            )
+
+        evidence_ids = set(
+            item.get(
+                "evidence_event_ids",
+                [],
+            )
+        )
+
+        evidence_overlap = (
+            pulse_ids
+            & evidence_ids
+        )
+
+        subject_codes = set(
+            aia_hi_item_subject_codes(
+                item
+            )
+        )
+
+        subject_match = (
+            subject_code
+            in subject_codes
+        )
+
+        if section_key == "site_hazards":
+            matched = False
+
+            if evidence_overlap:
+                matched = True
+                match_basis.add(
+                    "evidence_event_overlap"
+                )
+
+            if subject_match:
+                matched = True
+                match_basis.add(
+                    "subject_metadata"
+                )
+
+            if (
+                matched
+                and isinstance(
+                    item_id,
+                    str,
+                )
+                and item_id
+                not in matched_hi_item_ids
+            ):
+                matched_hi_item_ids.append(
+                    item_id
+                )
+
+        elif (
+            section_key == "ppe"
+            and subject_match
+        ):
+            match_basis.add(
+                "ppe_subject_metadata"
+            )
+
+            if (
+                isinstance(
+                    item_id,
+                    str,
+                )
+                and item_id
+                not in matched_hi_item_ids
+            ):
+                matched_hi_item_ids.append(
+                    item_id
+                )
+
+        if (
+            evidence_overlap
+            and isinstance(
+                item_id,
+                str,
+            )
+            and item_id
+            not in matched_hi_item_ids
+            and item_id
+            not in context_hi_item_ids
+        ):
+            context_hi_item_ids.append(
+                item_id
+            )
+
+    if matched_hi_item_ids:
+        state = "covered"
+    elif not history_complete:
+        state = (
+            "unknown_partial_scope"
+        )
+    else:
+        state = "potential_gap"
+
+    has_current_comparison_text = any(
+        item.get(
+            "section_key"
+        )
+        in {
+            "site_hazards",
+            "ppe",
+        }
+        for item
+        in hi_snapshot[
+            "items"
+        ]
+    )
+
+    return {
+        "state":
+            state,
+        "hi_revision":
+            hi_snapshot[
+                "revision"
+            ],
+        "compared_hi_item_ids":
+            compared_hi_item_ids,
+        "matched_hi_item_ids":
+            matched_hi_item_ids,
+        "context_hi_item_ids":
+            context_hi_item_ids,
+        "match_basis":
+            sorted(
+                match_basis
+            ),
+        "fallback_text_comparison_required":
+            (
+                state
+                == "potential_gap"
+                and has_current_comparison_text
+            ),
+    }
+
+
+def fetch_aia_hi_action_context(
+    conn: Connection,
+    *,
+    site_id: str,
+) -> Dict[str, Any]:
+    rows = fetch_all(
+        conn,
+        """
+        SELECT
+            id,
+            site_id,
+            revision,
+            action_type,
+            item_id,
+            actor_type,
+            actor_ref,
+            source_type,
+            evidence_event_ids_json,
+            action_payload_json,
+            snapshot_json,
+            occurred_at
+        FROM site_hi_actions
+        WHERE site_id = :site_id
+        ORDER BY
+            revision DESC,
+            id DESC
+        LIMIT :limit
+        """,
+        {
+            "site_id":
+                site_id,
+            "limit":
+                (
+                    AIA_HI_ACTION_CONTEXT_LIMIT
+                    + 1
+                ),
+        },
+    )
+
+    truncated = (
+        len(rows)
+        >
+        AIA_HI_ACTION_CONTEXT_LIMIT
+    )
+
+    included_rows = rows[
+        :AIA_HI_ACTION_CONTEXT_LIMIT
+    ]
+
+    actions = [
+        site_hi_action_from_row(
+            site_id,
+            row,
+        )
+        for row
+        in included_rows
+    ]
+
+    return {
+        "actions":
+            actions,
+        "scanned_count":
+            len(
+                actions
+            ),
+        "scan_limit":
+            AIA_HI_ACTION_CONTEXT_LIMIT,
+        "truncated":
+            truncated,
+    }
+
+
+def aia_relevant_hi_actions(
+    *,
+    pulse: Dict[str, Any],
+    coverage: Dict[str, Any],
+    hi_actions: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    pulse_ids = set(
+        pulse[
+            "event_ids"
+        ]
+    )
+
+    item_ids = set(
+        coverage[
+            "matched_hi_item_ids"
+        ]
+        + coverage[
+            "context_hi_item_ids"
+        ]
+    )
+
+    result: List[
+        Dict[str, Any]
+    ] = []
+
+    for action in hi_actions:
+        evidence_overlap = (
+            pulse_ids
+            & set(
+                action.get(
+                    "evidence_event_ids",
+                    [],
+                )
+            )
+        )
+
+        item_match = (
+            action.get(
+                "item_id"
+            )
+            in item_ids
+        )
+
+        if (
+            not evidence_overlap
+            and not item_match
+        ):
+            continue
+
+        result.append(
+            {
+                "id":
+                    action[
+                        "id"
+                    ],
+                "revision":
+                    action[
+                        "revision"
+                    ],
+                "action_type":
+                    action[
+                        "action_type"
+                    ],
+                "item_id":
+                    action.get(
+                        "item_id"
+                    ),
+                "source_type":
+                    action[
+                        "source_type"
+                    ],
+                "evidence_event_ids":
+                    action.get(
+                        "evidence_event_ids",
+                        [],
+                    ),
+                "occurred_at":
+                    action[
+                        "occurred_at"
+                    ],
+            }
+        )
+
+        if len(
+            result
+        ) >= 20:
+            break
+
+    return result
+
+
+def fetch_aia_prior_review_history(
+    conn: Connection,
+    *,
+    site_id: str,
+) -> Dict[str, Any]:
+    suggestion_rows = fetch_all(
+        conn,
+        """
+        SELECT
+            suggestion_id,
+            site_id,
+            subject_code,
+            subject_custom,
+            status,
+            contract_version,
+            analysis_window_from,
+            analysis_window_to,
+            retrieved_at,
+            history_complete,
+            evidence_event_ids_json,
+            hi_revision_at_analysis,
+            compared_hi_item_ids_json,
+            generated_at,
+            updated_at
+        FROM site_ai_suggestions
+        WHERE site_id = :site_id
+        ORDER BY
+            generated_at DESC,
+            suggestion_id DESC
+        LIMIT :limit
+        """,
+        {
+            "site_id":
+                site_id,
+            "limit":
+                (
+                    AIA_PRIOR_SUGGESTION_SCAN_LIMIT
+                    + 1
+                ),
+        },
+    )
+
+    decision_rows = fetch_all(
+        conn,
+        """
+        SELECT
+            id,
+            suggestion_id,
+            site_id,
+            decision,
+            resulting_hi_revision,
+            failure_detail,
+            occurred_at
+        FROM site_ai_decisions
+        WHERE site_id = :site_id
+        ORDER BY
+            occurred_at DESC,
+            id DESC
+        LIMIT :limit
+        """,
+        {
+            "site_id":
+                site_id,
+            "limit":
+                (
+                    AIA_PRIOR_DECISION_SCAN_LIMIT
+                    + 1
+                ),
+        },
+    )
+
+    suggestions_truncated = (
+        len(
+            suggestion_rows
+        )
+        >
+        AIA_PRIOR_SUGGESTION_SCAN_LIMIT
+    )
+
+    decisions_truncated = (
+        len(
+            decision_rows
+        )
+        >
+        AIA_PRIOR_DECISION_SCAN_LIMIT
+    )
+
+    suggestion_rows = (
+        suggestion_rows[
+            :AIA_PRIOR_SUGGESTION_SCAN_LIMIT
+        ]
+    )
+
+    decision_rows = (
+        decision_rows[
+            :AIA_PRIOR_DECISION_SCAN_LIMIT
+        ]
+    )
+
+    decisions_by_suggestion: Dict[
+        str,
+        List[Dict[str, Any]],
+    ] = {}
+
+    for row in decision_rows:
+        suggestion_id = row.get(
+            "suggestion_id"
+        )
+
+        if (
+            not isinstance(
+                suggestion_id,
+                str,
+            )
+            or not suggestion_id
+        ):
+            raise aia_storage_integrity_error(
+                site_id,
+                (
+                    "site_ai_decisions contains "
+                    "an invalid suggestion_id."
+                ),
+            )
+
+        decision = row.get(
+            "decision"
+        )
+
+        if (
+            decision
+            not in AIA_DECISION_TYPES
+        ):
+            raise aia_storage_integrity_error(
+                site_id,
+                (
+                    "site_ai_decisions contains "
+                    "an unknown decision."
+                ),
+            )
+
+        decisions_by_suggestion.setdefault(
+            suggestion_id,
+            [],
+        ).append(
+            {
+                "id":
+                    row[
+                        "id"
+                    ],
+                "decision":
+                    decision,
+                "resulting_hi_revision":
+                    row.get(
+                        "resulting_hi_revision"
+                    ),
+                "failure_detail":
+                    row.get(
+                        "failure_detail"
+                    ),
+                "occurred_at":
+                    row[
+                        "occurred_at"
+                    ],
+            }
+        )
+
+    suggestions: List[
+        Dict[str, Any]
+    ] = []
+
+    for row in suggestion_rows:
+        suggestion_id = row.get(
+            "suggestion_id"
+        )
+
+        if (
+            not isinstance(
+                suggestion_id,
+                str,
+            )
+            or not suggestion_id
+        ):
+            raise aia_storage_integrity_error(
+                site_id,
+                (
+                    "site_ai_suggestions contains "
+                    "an invalid suggestion_id."
+                ),
+            )
+
+        status = row.get(
+            "status"
+        )
+
+        if status not in AIA_SUGGESTION_STATUSES:
+            raise aia_storage_integrity_error(
+                site_id,
+                (
+                    "site_ai_suggestions contains "
+                    "an unknown status."
+                ),
+            )
+
+        subject_key = (
+            aia_subject_identity_key(
+                row.get(
+                    "subject_code"
+                ),
+                row.get(
+                    "subject_custom"
+                ),
+            )
+        )
+
+        if subject_key is None:
+            raise aia_storage_integrity_error(
+                site_id,
+                (
+                    "site_ai_suggestions contains "
+                    "invalid subject identity."
+                ),
+            )
+
+        event_ids = (
+            normalise_aia_stored_event_ids(
+                site_id,
+                "evidence_event_ids_json",
+                parse_aia_storage_json(
+                    site_id,
+                    "evidence_event_ids_json",
+                    row.get(
+                        "evidence_event_ids_json"
+                    ),
+                    list,
+                ),
+            )
+        )
+
+        compared_hi_item_ids = (
+            parse_aia_storage_json(
+                site_id,
+                "compared_hi_item_ids_json",
+                row.get(
+                    "compared_hi_item_ids_json"
+                ),
+                list,
+            )
+        )
+
+        if any(
+            not isinstance(
+                item_id,
+                str,
+            )
+            or not item_id
+            for item_id
+            in compared_hi_item_ids
+        ):
+            raise aia_storage_integrity_error(
+                site_id,
+                (
+                    "compared_hi_item_ids_json "
+                    "contains an invalid item ID."
+                ),
+            )
+
+        hi_revision = row.get(
+            "hi_revision_at_analysis"
+        )
+
+        if (
+            not isinstance(
+                hi_revision,
+                int,
+            )
+            or isinstance(
+                hi_revision,
+                bool,
+            )
+            or hi_revision < 0
+        ):
+            raise aia_storage_integrity_error(
+                site_id,
+                (
+                    "site_ai_suggestions contains "
+                    "an invalid H&I analysis revision."
+                ),
+            )
+
+        suggestions.append(
+            {
+                "suggestion_id":
+                    suggestion_id,
+                "subject_key":
+                    subject_key,
+                "subject_code":
+                    row[
+                        "subject_code"
+                    ],
+                "subject_custom":
+                    row.get(
+                        "subject_custom"
+                    ),
+                "status":
+                    status,
+                "evidence_event_ids":
+                    event_ids,
+                "hi_revision_at_analysis":
+                    hi_revision,
+                "compared_hi_item_ids":
+                    compared_hi_item_ids,
+                "generated_at":
+                    row[
+                        "generated_at"
+                    ],
+                "updated_at":
+                    row[
+                        "updated_at"
+                    ],
+                "decisions":
+                    decisions_by_suggestion.get(
+                        suggestion_id,
+                        [],
+                    ),
+            }
+        )
+
+    return {
+        "suggestions":
+            suggestions,
+        "complete":
+            not (
+                suggestions_truncated
+                or decisions_truncated
+            ),
+        "suggestions_scanned":
+            len(
+                suggestions
+            ),
+        "suggestion_scan_limit":
+            AIA_PRIOR_SUGGESTION_SCAN_LIMIT,
+        "suggestions_truncated":
+            suggestions_truncated,
+        "decisions_scanned":
+            len(
+                decision_rows
+            ),
+        "decision_scan_limit":
+            AIA_PRIOR_DECISION_SCAN_LIMIT,
+        "decisions_truncated":
+            decisions_truncated,
+    }
+
+
+def aia_latest_successful_decision(
+    suggestion: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    for decision in suggestion.get(
+        "decisions",
+        [],
+    ):
+        if not decision.get(
+            "failure_detail"
+        ):
+            return decision
+
+    return None
+
+
+def build_aia_prior_review_state(
+    *,
+    pulse: Dict[str, Any],
+    current_hi_revision: int,
+    prior_history: Dict[str, Any],
+) -> Dict[str, Any]:
+    subject_key = (
+        aia_subject_identity_key(
+            pulse.get(
+                "subject_code"
+            ),
+            pulse.get(
+                "subject_custom"
+            ),
+        )
+    )
+
+    if subject_key is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "AIA SubjectPulse contains "
+                "invalid subject identity."
+            ),
+        )
+
+    current_ids = set(
+        pulse[
+            "event_ids"
+        ]
+    )
+
+    related = [
+        suggestion
+        for suggestion
+        in prior_history[
+            "suggestions"
+        ]
+        if suggestion[
+            "subject_key"
+        ]
+        == subject_key
+    ]
+
+    related_ids = [
+        suggestion[
+            "suggestion_id"
+        ]
+        for suggestion
+        in related[
+            :20
+        ]
+    ]
+
+    stale_ids: List[str] = []
+
+    for suggestion in related:
+        prior_ids = set(
+            suggestion[
+                "evidence_event_ids"
+            ]
+        )
+
+        same_evidence = (
+            prior_ids
+            == current_ids
+        )
+
+        board_changed = (
+            suggestion[
+                "hi_revision_at_analysis"
+            ]
+            != current_hi_revision
+        )
+
+        evidence_changed = (
+            prior_ids
+            != current_ids
+        )
+
+        if (
+            board_changed
+            or evidence_changed
+        ):
+            stale_ids.append(
+                suggestion[
+                    "suggestion_id"
+                ]
+            )
+
+        if (
+            suggestion[
+                "status"
+            ]
+            == "pending"
+            and same_evidence
+            and not board_changed
+        ):
+            return {
+                "state":
+                    "existing_pending",
+                "suppress_candidate":
+                    True,
+                "suppress_state":
+                    "quiet_existing_pending",
+                "related_suggestion_ids":
+                    related_ids,
+                "stale_suggestion_ids":
+                    stale_ids,
+                "matching_suggestion_id":
+                    suggestion[
+                        "suggestion_id"
+                    ],
+                "same_evidence":
+                    True,
+                "board_changed_since_review":
+                    False,
+            }
+
+        if (
+            suggestion[
+                "status"
+            ]
+            == "decided"
+            and same_evidence
+            and not board_changed
+        ):
+            final_decision = (
+                aia_latest_successful_decision(
+                    suggestion
+                )
+            )
+
+            if final_decision is None:
+                continue
+
+            if (
+                final_decision[
+                    "decision"
+                ]
+                == "dismissed"
+            ):
+                return {
+                    "state":
+                        "unchanged_dismissed",
+                    "suppress_candidate":
+                        True,
+                    "suppress_state":
+                        "quiet_unchanged_dismissed",
+                    "related_suggestion_ids":
+                        related_ids,
+                    "stale_suggestion_ids":
+                        stale_ids,
+                    "matching_suggestion_id":
+                        suggestion[
+                            "suggestion_id"
+                        ],
+                    "same_evidence":
+                        True,
+                    "board_changed_since_review":
+                        False,
+                }
+
+            if (
+                final_decision[
+                    "decision"
+                ]
+                in {
+                    "confirmed",
+                    "edited_confirmed",
+                }
+                and final_decision.get(
+                    "resulting_hi_revision"
+                )
+                == current_hi_revision
+            ):
+                return {
+                    "state":
+                        "unchanged_confirmed",
+                    "suppress_candidate":
+                        True,
+                    "suppress_state":
+                        "quiet_prior_confirmed",
+                    "related_suggestion_ids":
+                        related_ids,
+                    "stale_suggestion_ids":
+                        stale_ids,
+                    "matching_suggestion_id":
+                        suggestion[
+                            "suggestion_id"
+                        ],
+                    "same_evidence":
+                        True,
+                    "board_changed_since_review":
+                        False,
+                }
+
+    if related:
+        newest = related[0]
+        newest_ids = set(
+            newest[
+                "evidence_event_ids"
+            ]
+        )
+
+        return {
+            "state":
+                "changed_or_stale",
+            "suppress_candidate":
+                False,
+            "suppress_state":
+                None,
+            "related_suggestion_ids":
+                related_ids,
+            "stale_suggestion_ids":
+                stale_ids[
+                    :20
+                ],
+            "matching_suggestion_id":
+                None,
+            "same_evidence":
+                newest_ids
+                == current_ids,
+            "board_changed_since_review":
+                newest[
+                    "hi_revision_at_analysis"
+                ]
+                != current_hi_revision,
+            "new_evidence_event_ids":
+                sorted(
+                    current_ids
+                    - newest_ids
+                ),
+        }
+
+    return {
+        "state":
+            "none",
+        "suppress_candidate":
+            False,
+        "suppress_state":
+            None,
+        "related_suggestion_ids":
+            [],
+        "stale_suggestion_ids":
+            [],
+        "matching_suggestion_id":
+            None,
+        "same_evidence":
+            False,
+        "board_changed_since_review":
+            False,
+        "new_evidence_event_ids":
+            [],
+    }
+
+
+def build_aia_candidate_analysis(
+    *,
+    pulse: Dict[str, Any],
+    history_scope: Dict[str, Any],
+    hi_snapshot: Dict[str, Any],
+    hi_actions: List[Dict[str, Any]],
+    prior_history: Dict[str, Any],
+) -> Dict[str, Any]:
+    history_complete = bool(
+        history_scope[
+            "complete"
+        ]
+    )
+
+    coverage = build_aia_hi_coverage(
+        pulse=pulse,
+        hi_snapshot=hi_snapshot,
+        history_complete=history_complete,
+    )
+
+    prior_review = (
+        build_aia_prior_review_state(
+            pulse=pulse,
+            current_hi_revision=
+                hi_snapshot[
+                    "revision"
+                ],
+            prior_history=
+                prior_history,
+        )
+    )
+
+    threshold_met = (
+        pulse[
+            "support_count"
+        ]
+        >= AIA_RECURRENCE_MIN_SUPPORT
+    )
+
+    reason_codes: List[str] = []
+
+    if history_complete:
+        reason_codes.append(
+            "complete_history"
+        )
+    else:
+        reason_codes.append(
+            "partial_history"
+        )
+
+    if threshold_met:
+        reason_codes.append(
+            "recurrence_threshold_met"
+        )
+    else:
+        reason_codes.append(
+            "recurrence_below_threshold"
+        )
+
+    if coverage[
+        "state"
+    ] == "covered":
+        reason_codes.append(
+            "current_hi_exact_coverage"
+        )
+    elif coverage[
+        "state"
+    ] == "potential_gap":
+        reason_codes.append(
+            "no_exact_current_coverage"
+        )
+    else:
+        reason_codes.append(
+            "coverage_unknown_partial_scope"
+        )
+
+    if not prior_history[
+        "complete"
+    ]:
+        state = (
+            "blocked_prior_review_history_partial"
+        )
+        eligible = False
+        reason_codes.append(
+            "prior_review_history_partial"
+        )
+
+    elif not history_complete:
+        state = (
+            "blocked_partial_history"
+        )
+        eligible = False
+
+    elif not threshold_met:
+        state = (
+            "quiet_below_threshold"
+        )
+        eligible = False
+
+    elif coverage[
+        "state"
+    ] == "covered":
+        state = "quiet_covered"
+        eligible = False
+
+    elif prior_review[
+        "suppress_candidate"
+    ]:
+        state = str(
+            prior_review[
+                "suppress_state"
+            ]
+        )
+        eligible = False
+        reason_codes.append(
+            prior_review[
+                "state"
+            ]
+        )
+
+    else:
+        state = "mature_candidate"
+        eligible = True
+        reason_codes.append(
+            "deterministic_candidate_ready_for_aia2"
+        )
+
+        if (
+            prior_review[
+                "state"
+            ]
+            == "changed_or_stale"
+        ):
+            reason_codes.append(
+                "prior_review_changed_or_stale"
+            )
+
+    return {
+        "subject_pulse":
+            pulse,
+        "recurrence": {
+            "support_count":
+                pulse[
+                    "support_count"
+                ],
+            "threshold":
+                AIA_RECURRENCE_MIN_SUPPORT,
+            "threshold_met":
+                threshold_met,
+        },
+        "coverage":
+            coverage,
+        "hi_history_context": {
+            "relevant_actions":
+                aia_relevant_hi_actions(
+                    pulse=pulse,
+                    coverage=coverage,
+                    hi_actions=hi_actions,
+                ),
+        },
+        "prior_review":
+            prior_review,
+        "candidate": {
+            "state":
+                state,
+            "eligible":
+                eligible,
+            "reason_codes":
+                reason_codes,
+        },
+    }
+
+
+# =========================================================
 # Health
 # =========================================================
 
@@ -5931,6 +7408,281 @@ async def admin_site_ai_subject_pulse(
                 ],
             "unclassified_evidence":
                 unclassified,
+        }
+
+
+# =========================================================
+# AIA.1C - H&I Coverage + Candidate Gate Read-Only Route
+# =========================================================
+
+@app.get(
+    "/admin/sites/{site_id}/ai/candidate-analysis"
+)
+async def admin_site_ai_candidate_analysis(
+    site_id: str,
+    from_timestamp: Optional[str] = Query(
+        default=None,
+        alias="from",
+    ),
+    to_timestamp: Optional[str] = Query(
+        default=None,
+        alias="to",
+    ),
+):
+    """
+    Compare deterministic SubjectPulse evidence with current H&I,
+    H&I action context and prior AIA review history.
+
+    AIA.1C performs no model invocation, creates no suggestion,
+    creates no decision and does not author/clear H&I. Normal H&I
+    lazy expiry remains governed by the existing H&I read law.
+    """
+    from_value = parse_query_iso(
+        from_timestamp,
+        "from",
+    )
+
+    requested_to = parse_query_iso(
+        to_timestamp,
+        "to",
+    )
+
+    retrieved_at = utc_now_iso()
+
+    effective_to = (
+        requested_to
+        if requested_to is not None
+        else retrieved_at
+    )
+
+    if (
+        from_value is not None
+        and from_value > effective_to
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid AIA Candidate Analysis date range. "
+                "The from timestamp must be earlier "
+                "than or equal to the to timestamp."
+            ),
+        )
+
+    with get_db() as conn:
+        require_aia_generation_site(
+            conn,
+            site_id,
+        )
+
+        rows = fetch_aia_subject_evidence(
+            conn,
+            site_id=site_id,
+            from_value=from_value,
+            to_value=effective_to,
+            max_events=
+                AIA_SUBJECT_PULSE_MAX_EVENTS,
+        )
+
+        truncated = (
+            len(rows)
+            >
+            AIA_SUBJECT_PULSE_MAX_EVENTS
+        )
+
+        included_rows = rows[
+            :AIA_SUBJECT_PULSE_MAX_EVENTS
+        ]
+
+        prepared = (
+            build_aia_subject_pulses(
+                site_id=site_id,
+                rows=included_rows,
+            )
+        )
+
+        unclassified = prepared[
+            "unclassified_evidence"
+        ]
+
+        history_scope = (
+            build_aia_history_scope(
+                from_value=from_value,
+                to_value=effective_to,
+                retrieved_at=
+                    retrieved_at,
+                relevant_event_count=
+                    len(
+                        included_rows
+                    ),
+                structured_event_count=
+                    prepared[
+                        "structured_event_count"
+                    ],
+                unclassified_event_count=
+                    unclassified[
+                        "count"
+                    ],
+                event_cap=
+                    AIA_SUBJECT_PULSE_MAX_EVENTS,
+                truncated=
+                    truncated,
+            )
+        )
+
+        # Existing H&I law may lazily materialise already-authorised
+        # valid_until expiry. AIA itself does not publish/edit/clear.
+        hi_snapshot = (
+            load_site_hi_snapshot(
+                conn,
+                site_id,
+            )
+        )
+
+        hi_action_context = (
+            fetch_aia_hi_action_context(
+                conn,
+                site_id=site_id,
+            )
+        )
+
+        prior_history = (
+            fetch_aia_prior_review_history(
+                conn,
+                site_id=site_id,
+            )
+        )
+
+        analyses = [
+            build_aia_candidate_analysis(
+                pulse=pulse,
+                history_scope=
+                    history_scope,
+                hi_snapshot=
+                    hi_snapshot,
+                hi_actions=
+                    hi_action_context[
+                        "actions"
+                    ],
+                prior_history=
+                    prior_history,
+            )
+            for pulse
+            in prepared[
+                "subject_pulses"
+            ]
+        ]
+
+        candidate_count = sum(
+            1
+            for analysis
+            in analyses
+            if analysis[
+                "candidate"
+            ][
+                "eligible"
+            ]
+        )
+
+        blocked_count = sum(
+            1
+            for analysis
+            in analyses
+            if str(
+                analysis[
+                    "candidate"
+                ][
+                    "state"
+                ]
+            ).startswith(
+                "blocked_"
+            )
+        )
+
+        quiet_count = (
+            len(
+                analyses
+            )
+            - candidate_count
+            - blocked_count
+        )
+
+        return {
+            "contract_version":
+                AIA_CANDIDATE_CONTRACT_VERSION,
+            "subject_pulse_contract_version":
+                AIA_SUBJECT_PULSE_CONTRACT_VERSION,
+            "site_id":
+                site_id,
+            "retrieved_at":
+                retrieved_at,
+            "history_scope":
+                history_scope,
+            "recurrence_threshold":
+                AIA_RECURRENCE_MIN_SUPPORT,
+            "hi_snapshot":
+                aia_hi_snapshot_summary(
+                    hi_snapshot
+                ),
+            "hi_history": {
+                "scanned_count":
+                    hi_action_context[
+                        "scanned_count"
+                    ],
+                "scan_limit":
+                    hi_action_context[
+                        "scan_limit"
+                    ],
+                "truncated":
+                    hi_action_context[
+                        "truncated"
+                    ],
+            },
+            "prior_review_history": {
+                "complete":
+                    prior_history[
+                        "complete"
+                    ],
+                "suggestions_scanned":
+                    prior_history[
+                        "suggestions_scanned"
+                    ],
+                "suggestion_scan_limit":
+                    prior_history[
+                        "suggestion_scan_limit"
+                    ],
+                "suggestions_truncated":
+                    prior_history[
+                        "suggestions_truncated"
+                    ],
+                "decisions_scanned":
+                    prior_history[
+                        "decisions_scanned"
+                    ],
+                "decision_scan_limit":
+                    prior_history[
+                        "decision_scan_limit"
+                    ],
+                "decisions_truncated":
+                    prior_history[
+                        "decisions_truncated"
+                    ],
+            },
+            "analyses":
+                analyses,
+            "candidate_count":
+                candidate_count,
+            "quiet_count":
+                quiet_count,
+            "blocked_count":
+                blocked_count,
+            "unclassified_evidence":
+                unclassified,
+            "model_invocation":
+                False,
+            "suggestion_write_count":
+                0,
+            "decision_write_count":
+                0,
         }
 
 
