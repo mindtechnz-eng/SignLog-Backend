@@ -1,5 +1,3 @@
-
-
 from __future__ import annotations
 
 import json
@@ -688,6 +686,191 @@ def ensure_site_hi_schema(
 
 
 # =========================================================
+# AIA.1A - Persistence Foundation
+# =========================================================
+
+def ensure_site_ai_schema(
+    conn: Connection,
+) -> None:
+    """
+    Create the isolated AI-ASSIST persistence foundation.
+
+    AIA.1A establishes only durable storage for future
+    suggestions and human decisions. It does not generate
+    SubjectPulse objects, call a model, expose Assistant
+    routes, or mutate H&I.
+    """
+    execute_write(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS site_ai_suggestions (
+            suggestion_id TEXT PRIMARY KEY,
+            site_id TEXT NOT NULL,
+            subject_code TEXT NOT NULL,
+            subject_custom TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            contract_version TEXT NOT NULL,
+            analysis_window_from TEXT,
+            analysis_window_to TEXT,
+            retrieved_at TEXT NOT NULL,
+            history_complete INTEGER NOT NULL,
+            evidence_event_ids_json TEXT NOT NULL,
+            hi_revision_at_analysis INTEGER NOT NULL,
+            compared_hi_item_ids_json TEXT NOT NULL,
+            interpretation_json TEXT,
+            board_gap_json TEXT,
+            suggestion_type TEXT,
+            proposed_hi_payload_json TEXT,
+            engine_id TEXT,
+            model_id TEXT,
+            inference_contract_version TEXT,
+            supersedes_suggestion_id TEXT,
+            generated_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(site_id)
+                REFERENCES sites(site_id),
+            FOREIGN KEY(supersedes_suggestion_id)
+                REFERENCES site_ai_suggestions(suggestion_id)
+        )
+        """,
+    )
+
+    if DB_MODE == "postgres":
+        execute_write(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS site_ai_decisions (
+                id SERIAL PRIMARY KEY,
+                suggestion_id TEXT NOT NULL,
+                site_id TEXT NOT NULL,
+                actor_type TEXT NOT NULL,
+                actor_ref TEXT,
+                decision TEXT NOT NULL,
+                original_proposal_hash TEXT,
+                decision_payload_json TEXT NOT NULL,
+                resulting_hi_revision INTEGER,
+                failure_detail TEXT,
+                occurred_at TEXT NOT NULL,
+                FOREIGN KEY(suggestion_id)
+                    REFERENCES site_ai_suggestions(suggestion_id),
+                FOREIGN KEY(site_id)
+                    REFERENCES sites(site_id)
+            )
+            """,
+        )
+    else:
+        execute_write(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS site_ai_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                suggestion_id TEXT NOT NULL,
+                site_id TEXT NOT NULL,
+                actor_type TEXT NOT NULL,
+                actor_ref TEXT,
+                decision TEXT NOT NULL,
+                original_proposal_hash TEXT,
+                decision_payload_json TEXT NOT NULL,
+                resulting_hi_revision INTEGER,
+                failure_detail TEXT,
+                occurred_at TEXT NOT NULL,
+                FOREIGN KEY(suggestion_id)
+                    REFERENCES site_ai_suggestions(suggestion_id),
+                FOREIGN KEY(site_id)
+                    REFERENCES sites(site_id)
+            )
+            """,
+        )
+
+    execute_write(
+        conn,
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_site_ai_suggestions_site_status_time
+        ON site_ai_suggestions(
+            site_id,
+            status,
+            generated_at
+        )
+        """,
+    )
+
+    execute_write(
+        conn,
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_site_ai_suggestions_site_subject_time
+        ON site_ai_suggestions(
+            site_id,
+            subject_code,
+            generated_at
+        )
+        """,
+    )
+
+    execute_write(
+        conn,
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_site_ai_suggestions_site_hi_revision
+        ON site_ai_suggestions(
+            site_id,
+            hi_revision_at_analysis
+        )
+        """,
+    )
+
+    execute_write(
+        conn,
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_site_ai_suggestions_supersedes
+        ON site_ai_suggestions(
+            supersedes_suggestion_id
+        )
+        """,
+    )
+
+    execute_write(
+        conn,
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_site_ai_decisions_suggestion_time_id
+        ON site_ai_decisions(
+            suggestion_id,
+            occurred_at,
+            id
+        )
+        """,
+    )
+
+    execute_write(
+        conn,
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_site_ai_decisions_site_time_id
+        ON site_ai_decisions(
+            site_id,
+            occurred_at,
+            id
+        )
+        """,
+    )
+
+    execute_write(
+        conn,
+        """
+        CREATE INDEX IF NOT EXISTS
+            idx_site_ai_decisions_site_hi_revision
+        ON site_ai_decisions(
+            site_id,
+            resulting_hi_revision
+        )
+        """,
+    )
+
+
+# =========================================================
 # Database Init
 # =========================================================
 
@@ -730,6 +913,7 @@ def init_db() -> None:
         ensure_sites_lifecycle_schema(conn)
         ensure_sites_display_policy_schema(conn)
         ensure_site_hi_schema(conn)
+        ensure_site_ai_schema(conn)
 
         conn.execute(
             text(
@@ -3755,6 +3939,92 @@ def resolve_kiosk_hi_site_id(
 
 
 # =========================================================
+# AIA.1A - Core Domain
+# =========================================================
+
+AIA_SUGGESTION_STATUSES = {
+    "pending",
+    "decided",
+    "superseded",
+}
+
+AIA_DECISION_TYPES = {
+    "confirmed",
+    "edited_confirmed",
+    "dismissed",
+}
+
+AIA_SUGGESTION_TYPES = {
+    "publish_site_hazard",
+    "ppe_review",
+    "review_only",
+}
+
+
+def require_aia_site(
+    conn: Connection,
+    site_id: str,
+) -> Dict[str, Any]:
+    """
+    AIA Site read boundary.
+
+    AIA history remains readable for archived Sites, so the
+    read guard mirrors the existing H&I Site existence guard.
+    """
+    return require_hi_site(
+        conn,
+        site_id,
+    )
+
+
+def require_aia_generation_site(
+    conn: Connection,
+    site_id: str,
+) -> Dict[str, Any]:
+    """
+    AIA analysis / suggestion-generation boundary.
+
+    Archived Sites remain readable but may not generate new
+    AIA candidates or suggestions.
+    """
+    site = require_aia_site(
+        conn,
+        site_id,
+    )
+
+    if (
+        site.get("operational_state")
+        != "active"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Archived Site AI-ASSIST is read-only. "
+                "Restore the Site before generating "
+                "new Assistant analysis or suggestions."
+            ),
+        )
+
+    return site
+
+
+def aia_json_dumps(
+    value: Any,
+) -> str:
+    """
+    Compact AIA JSON storage helper.
+
+    Empty lists/objects are preserved exactly for the AIA
+    suggestion/decision persistence domain.
+    """
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+# =========================================================
 # Health
 # =========================================================
 
@@ -6094,4 +6364,3 @@ async def api_full_headcount(
             "site_id": site_id,
             **state,
         }
-        
