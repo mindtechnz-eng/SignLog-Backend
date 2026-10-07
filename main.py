@@ -7810,6 +7810,1027 @@ def persist_aia2_suggestion(
 
 
 # =========================================================
+# AIA.3A - Admin Assistant Governed Read Domain
+# =========================================================
+
+AIA3_ASSISTANT_CONTRACT_VERSION = "assistant-surface.v1"
+AIA3_RECENT_HISTORY_LIMIT = 10
+AIA3_EVIDENCE_QUERY_CHUNK = 400
+
+
+def aia3_runtime_configured() -> bool:
+    """
+    Return only the narrow runtime-readiness truth needed by the
+    Assistant surface. Provider/model/key values themselves are not
+    exposed to Admin.
+    """
+    provider = os.getenv(
+        "AIA_MODEL_PROVIDER",
+        "openai",
+    ).strip().lower()
+
+    model_id = os.getenv(
+        "AIA_MODEL_ID",
+        "",
+    ).strip()
+
+    api_key = os.getenv(
+        "OPENAI_API_KEY",
+        "",
+    ).strip()
+
+    return bool(
+        provider == "openai"
+        and model_id
+        and api_key
+    )
+
+
+def aia3_parse_optional_storage_object(
+    site_id: str,
+    field_name: str,
+    value: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+
+    return parse_aia_storage_json(
+        site_id,
+        field_name,
+        value,
+        dict,
+    )
+
+
+def aia3_suggestion_from_row(
+    site_id: str,
+    row: Dict[str, Any],
+) -> Dict[str, Any]:
+    suggestion_id = row.get(
+        "suggestion_id"
+    )
+
+    if (
+        not isinstance(
+            suggestion_id,
+            str,
+        )
+        or not suggestion_id
+    ):
+        raise aia_storage_integrity_error(
+            site_id,
+            "site_ai_suggestions contains an invalid suggestion_id.",
+        )
+
+    if row.get("site_id") != site_id:
+        raise aia_storage_integrity_error(
+            site_id,
+            "AI suggestion Site identity does not match its row.",
+        )
+
+    status = row.get("status")
+    if status not in AIA_SUGGESTION_STATUSES:
+        raise aia_storage_integrity_error(
+            site_id,
+            "site_ai_suggestions contains an unknown status.",
+        )
+
+    subject_code = row.get(
+        "subject_code"
+    )
+    subject_custom = row.get(
+        "subject_custom"
+    )
+
+    subject_key = aia_subject_identity_key(
+        subject_code,
+        subject_custom,
+    )
+
+    if subject_key is None:
+        raise aia_storage_integrity_error(
+            site_id,
+            "site_ai_suggestions contains invalid subject identity.",
+        )
+
+    history_complete_raw = row.get(
+        "history_complete"
+    )
+    if history_complete_raw not in {
+        0,
+        1,
+        False,
+        True,
+    }:
+        raise aia_storage_integrity_error(
+            site_id,
+            "site_ai_suggestions contains invalid history_complete truth.",
+        )
+
+    evidence_event_ids = (
+        normalise_aia_stored_event_ids(
+            site_id,
+            "evidence_event_ids_json",
+            parse_aia_storage_json(
+                site_id,
+                "evidence_event_ids_json",
+                row.get(
+                    "evidence_event_ids_json"
+                ),
+                list,
+            ),
+        )
+    )
+
+    compared_hi_item_ids = (
+        parse_aia_storage_json(
+            site_id,
+            "compared_hi_item_ids_json",
+            row.get(
+                "compared_hi_item_ids_json"
+            ),
+            list,
+        )
+    )
+
+    if any(
+        not isinstance(item_id, str)
+        or not item_id
+        for item_id in compared_hi_item_ids
+    ):
+        raise aia_storage_integrity_error(
+            site_id,
+            "compared_hi_item_ids_json contains an invalid item ID.",
+        )
+
+    hi_revision = row.get(
+        "hi_revision_at_analysis"
+    )
+    if (
+        not isinstance(hi_revision, int)
+        or isinstance(hi_revision, bool)
+        or hi_revision < 0
+    ):
+        raise aia_storage_integrity_error(
+            site_id,
+            "site_ai_suggestions contains an invalid H&I analysis revision.",
+        )
+
+    suggestion_type = row.get(
+        "suggestion_type"
+    )
+    if (
+        suggestion_type is not None
+        and suggestion_type
+        not in AIA_SUGGESTION_TYPES
+    ):
+        raise aia_storage_integrity_error(
+            site_id,
+            "site_ai_suggestions contains an unknown suggestion_type.",
+        )
+
+    interpretation = (
+        aia3_parse_optional_storage_object(
+            site_id,
+            "interpretation_json",
+            row.get(
+                "interpretation_json"
+            ),
+        )
+    )
+
+    board_gap = (
+        aia3_parse_optional_storage_object(
+            site_id,
+            "board_gap_json",
+            row.get(
+                "board_gap_json"
+            ),
+        )
+    )
+
+    proposed_hi_payload = (
+        aia3_parse_optional_storage_object(
+            site_id,
+            "proposed_hi_payload_json",
+            row.get(
+                "proposed_hi_payload_json"
+            ),
+        )
+    )
+
+    return {
+        "suggestion_id": suggestion_id,
+        "site_id": site_id,
+        "subject_key": subject_key,
+        "subject_code": subject_code,
+        "subject_custom": subject_custom,
+        "status": status,
+        "contract_version": row.get(
+            "contract_version"
+        ),
+        "analysis_window_from": row.get(
+            "analysis_window_from"
+        ),
+        "analysis_window_to": row.get(
+            "analysis_window_to"
+        ),
+        "retrieved_at": row.get(
+            "retrieved_at"
+        ),
+        "history_complete": bool(
+            history_complete_raw
+        ),
+        "evidence_event_ids":
+            evidence_event_ids,
+        "hi_revision_at_analysis":
+            hi_revision,
+        "compared_hi_item_ids":
+            compared_hi_item_ids,
+        "interpretation": interpretation,
+        "board_gap": board_gap,
+        "suggestion_type":
+            suggestion_type,
+        "proposed_hi_payload":
+            proposed_hi_payload,
+        "engine_id": row.get(
+            "engine_id"
+        ),
+        "model_id": row.get(
+            "model_id"
+        ),
+        "inference_contract_version":
+            row.get(
+                "inference_contract_version"
+            ),
+        "supersedes_suggestion_id":
+            row.get(
+                "supersedes_suggestion_id"
+            ),
+        "generated_at": row.get(
+            "generated_at"
+        ),
+        "updated_at": row.get(
+            "updated_at"
+        ),
+    }
+
+
+def aia3_suggestion_select_sql() -> str:
+    return """
+        SELECT
+            suggestion_id,
+            site_id,
+            subject_code,
+            subject_custom,
+            status,
+            contract_version,
+            analysis_window_from,
+            analysis_window_to,
+            retrieved_at,
+            history_complete,
+            evidence_event_ids_json,
+            hi_revision_at_analysis,
+            compared_hi_item_ids_json,
+            interpretation_json,
+            board_gap_json,
+            suggestion_type,
+            proposed_hi_payload_json,
+            engine_id,
+            model_id,
+            inference_contract_version,
+            supersedes_suggestion_id,
+            generated_at,
+            updated_at
+        FROM site_ai_suggestions
+    """
+
+
+def fetch_aia3_suggestion(
+    conn: Connection,
+    *,
+    site_id: str,
+    suggestion_id: str,
+) -> Dict[str, Any]:
+    row = fetch_one(
+        conn,
+        aia3_suggestion_select_sql()
+        + """
+          WHERE site_id = :site_id
+            AND suggestion_id = :suggestion_id
+          LIMIT 1
+        """,
+        {
+            "site_id": site_id,
+            "suggestion_id":
+                suggestion_id,
+        },
+    )
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "AI-ASSIST suggestion not found for this Site."
+            ),
+        )
+
+    return aia3_suggestion_from_row(
+        site_id,
+        row,
+    )
+
+
+def fetch_aia3_site_suggestions(
+    conn: Connection,
+    *,
+    site_id: str,
+    status: Optional[str] = None,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    if (
+        status is not None
+        and status
+        not in AIA_SUGGESTION_STATUSES
+    ):
+        raise ValueError(
+            "Unsupported internal AIA suggestion status."
+        )
+
+    sql = (
+        aia3_suggestion_select_sql()
+        + " WHERE site_id = :site_id"
+    )
+
+    params: Dict[str, Any] = {
+        "site_id": site_id,
+        "limit": limit,
+    }
+
+    if status is not None:
+        sql += " AND status = :status"
+        params["status"] = status
+
+    sql += (
+        " ORDER BY generated_at DESC, "
+        "suggestion_id DESC LIMIT :limit"
+    )
+
+    return [
+        aia3_suggestion_from_row(
+            site_id,
+            row,
+        )
+        for row in fetch_all(
+            conn,
+            sql,
+            params,
+        )
+    ]
+
+
+def aia3_event_projection(
+    row: Dict[str, Any],
+) -> Dict[str, Any]:
+    payload = json_loads(
+        row.get(
+            "payload_json"
+        )
+    )
+
+    return {
+        "id": row.get("id"),
+        "site_id": row.get(
+            "site_id"
+        ),
+        "device_id": row.get(
+            "device_id"
+        ),
+        "kiosk_id": row.get(
+            "device_id"
+        ),
+        "event_type": row.get(
+            "event_type"
+        ),
+        "timestamp": row.get(
+            "occurred_at"
+        ),
+        "payload": payload,
+        "worker_id": payload.get(
+            "worker_id"
+        ),
+        "name": payload.get(
+            "name"
+        ),
+        "company": payload.get(
+            "company"
+        ),
+        "role": payload.get(
+            "role"
+        ),
+        "subject_code": payload.get(
+            "subject_code"
+        ),
+        "subject_custom": payload.get(
+            "subject_custom"
+        ),
+        "title": payload.get(
+            "title"
+        ),
+        "description": payload.get(
+            "description"
+        ),
+        "severity": payload.get(
+            "severity"
+        ),
+        "injury": payload.get(
+            "injury"
+        ),
+        "note": payload.get(
+            "note"
+        ),
+    }
+
+
+def fetch_aia3_evidence_records(
+    conn: Connection,
+    *,
+    site_id: str,
+    event_ids: List[int],
+) -> Dict[str, Any]:
+    if not event_ids:
+        return {
+            "records": [],
+            "missing_event_ids": [],
+        }
+
+    rows_by_id: Dict[
+        int,
+        Dict[str, Any],
+    ] = {}
+
+    for start in range(
+        0,
+        len(event_ids),
+        AIA3_EVIDENCE_QUERY_CHUNK,
+    ):
+        chunk = event_ids[
+            start:
+            start + AIA3_EVIDENCE_QUERY_CHUNK
+        ]
+
+        placeholders: List[str] = []
+        params: Dict[str, Any] = {
+            "site_id": site_id,
+        }
+
+        for index, event_id in enumerate(
+            chunk
+        ):
+            key = f"event_id_{index}"
+            placeholders.append(
+                f":{key}"
+            )
+            params[key] = event_id
+
+        rows = fetch_all(
+            conn,
+            f"""
+            SELECT
+                id,
+                site_id,
+                device_id,
+                event_type,
+                occurred_at,
+                payload_json,
+                created_at
+            FROM events
+            WHERE site_id = :site_id
+              AND id IN (
+                  {', '.join(placeholders)}
+              )
+            """,
+            params,
+        )
+
+        for row in rows:
+            rows_by_id[
+                int(row["id"])
+            ] = row
+
+    records: List[
+        Dict[str, Any]
+    ] = []
+    missing_event_ids: List[int] = []
+
+    for event_id in event_ids:
+        row = rows_by_id.get(
+            event_id
+        )
+
+        if row is None:
+            missing_event_ids.append(
+                event_id
+            )
+            continue
+
+        records.append(
+            aia3_event_projection(
+                row
+            )
+        )
+
+    return {
+        "records": records,
+        "missing_event_ids":
+            missing_event_ids,
+    }
+
+
+def build_aia3_evidence_summary(
+    *,
+    stored_event_ids: List[int],
+    records: List[Dict[str, Any]],
+    missing_event_ids: List[int],
+) -> Dict[str, Any]:
+    hazard_count = sum(
+        1
+        for event in records
+        if event.get(
+            "event_type"
+        ) == "hazard"
+    )
+
+    incident_count = sum(
+        1
+        for event in records
+        if event.get(
+            "event_type"
+        ) == "incident"
+    )
+
+    injury_incident_count = sum(
+        1
+        for event in records
+        if (
+            event.get(
+                "event_type"
+            ) == "incident"
+            and aia_bool(
+                event.get(
+                    "injury"
+                )
+            )
+        )
+    )
+
+    timestamps = [
+        str(event["timestamp"])
+        for event in records
+        if event.get(
+            "timestamp"
+        )
+    ]
+
+    return {
+        "support_count":
+            len(stored_event_ids),
+        "resolved_count":
+            len(records),
+        "hazard_count": hazard_count,
+        "incident_count":
+            incident_count,
+        "injury_incident_count":
+            injury_incident_count,
+        "first_at": (
+            min(timestamps)
+            if timestamps
+            else None
+        ),
+        "last_at": (
+            max(timestamps)
+            if timestamps
+            else None
+        ),
+        "missing_event_ids":
+            missing_event_ids,
+        "complete":
+            len(missing_event_ids) == 0,
+    }
+
+
+def aia3_current_subject_state(
+    conn: Connection,
+    *,
+    site_id: str,
+    suggestion: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Rebuild the current deterministic subject evidence through now.
+
+    The lower bound is preserved from the stored suggestion while the
+    upper bound advances to current Backend time. This allows later
+    same-subject evidence to mark an older review stale instead of
+    being silently absorbed into it.
+    """
+    current_to = utc_now_iso()
+    from_value = suggestion.get(
+        "analysis_window_from"
+    )
+
+    rows = fetch_aia_subject_evidence(
+        conn,
+        site_id=site_id,
+        from_value=from_value,
+        to_value=current_to,
+        max_events=
+            AIA_SUBJECT_PULSE_MAX_EVENTS,
+    )
+
+    truncated = (
+        len(rows)
+        > AIA_SUBJECT_PULSE_MAX_EVENTS
+    )
+
+    included_rows = rows[
+        :AIA_SUBJECT_PULSE_MAX_EVENTS
+    ]
+
+    prepared = build_aia_subject_pulses(
+        site_id=site_id,
+        rows=included_rows,
+    )
+
+    pulse = None
+    for candidate in prepared[
+        "subject_pulses"
+    ]:
+        key = aia_subject_identity_key(
+            candidate.get(
+                "subject_code"
+            ),
+            candidate.get(
+                "subject_custom"
+            ),
+        )
+
+        if key == suggestion[
+            "subject_key"
+        ]:
+            pulse = candidate
+            break
+
+    return {
+        "complete": not truncated,
+        "to": current_to,
+        "event_cap":
+            AIA_SUBJECT_PULSE_MAX_EVENTS,
+        "truncated": truncated,
+        "pulse": pulse,
+    }
+
+
+def build_aia3_staleness(
+    *,
+    suggestion: Dict[str, Any],
+    current_hi_snapshot: Dict[str, Any],
+    current_subject_state: Dict[str, Any],
+    missing_event_ids: List[int],
+    site_operational_state: Optional[str],
+) -> Dict[str, Any]:
+    stored_ids = set(
+        suggestion[
+            "evidence_event_ids"
+        ]
+    )
+
+    current_pulse = (
+        current_subject_state[
+            "pulse"
+        ]
+    )
+
+    current_ids = set(
+        current_pulse[
+            "event_ids"
+        ]
+        if current_pulse
+        else []
+    )
+
+    board_changed = (
+        current_hi_snapshot[
+            "revision"
+        ]
+        != suggestion[
+            "hi_revision_at_analysis"
+        ]
+    )
+
+    scope_complete = bool(
+        current_subject_state[
+            "complete"
+        ]
+    )
+
+    new_event_ids = sorted(
+        current_ids - stored_ids
+    )
+    no_longer_in_current_ids = sorted(
+        stored_ids - current_ids
+    )
+
+    evidence_changed = (
+        scope_complete
+        and current_ids
+        != stored_ids
+    )
+
+    reasons: List[str] = []
+
+    if board_changed:
+        reasons.append(
+            "hi_revision_changed"
+        )
+
+    if not scope_complete:
+        reasons.append(
+            "current_evidence_scope_partial"
+        )
+
+    if new_event_ids:
+        reasons.append(
+            "new_subject_evidence"
+        )
+
+    if (
+        scope_complete
+        and no_longer_in_current_ids
+    ):
+        reasons.append(
+            "subject_evidence_set_changed"
+        )
+
+    if missing_event_ids:
+        reasons.append(
+            "stored_evidence_missing"
+        )
+
+    stale = bool(
+        board_changed
+        or not scope_complete
+        or evidence_changed
+        or missing_event_ids
+    )
+
+    actionable = bool(
+        suggestion[
+            "status"
+        ] == "pending"
+        and site_operational_state
+        == "active"
+        and not stale
+    )
+
+    return {
+        "stale": stale,
+        "actionable": actionable,
+        "reasons": reasons,
+        "board_changed":
+            board_changed,
+        "board_revision_at_analysis":
+            suggestion[
+                "hi_revision_at_analysis"
+            ],
+        "current_board_revision":
+            current_hi_snapshot[
+                "revision"
+            ],
+        "current_evidence_scope_complete":
+            scope_complete,
+        "new_evidence_event_ids":
+            new_event_ids,
+        "stored_ids_not_in_current_subject":
+            no_longer_in_current_ids,
+        "missing_stored_evidence_ids":
+            missing_event_ids,
+    }
+
+
+def aia3_decision_from_row(
+    site_id: str,
+    row: Dict[str, Any],
+) -> Dict[str, Any]:
+    decision = row.get(
+        "decision"
+    )
+
+    if decision not in AIA_DECISION_TYPES:
+        raise aia_storage_integrity_error(
+            site_id,
+            "site_ai_decisions contains an unknown decision.",
+        )
+
+    payload = parse_aia_storage_json(
+        site_id,
+        "decision_payload_json",
+        row.get(
+            "decision_payload_json"
+        ),
+        dict,
+    )
+
+    return {
+        "id": row.get("id"),
+        "suggestion_id": row.get(
+            "suggestion_id"
+        ),
+        "site_id": site_id,
+        "actor_type": row.get(
+            "actor_type"
+        ),
+        "actor_ref": row.get(
+            "actor_ref"
+        ),
+        "decision": decision,
+        "original_proposal_hash":
+            row.get(
+                "original_proposal_hash"
+            ),
+        "decision_payload": payload,
+        "resulting_hi_revision":
+            row.get(
+                "resulting_hi_revision"
+            ),
+        "failure_detail": row.get(
+            "failure_detail"
+        ),
+        "occurred_at": row.get(
+            "occurred_at"
+        ),
+    }
+
+
+def fetch_aia3_suggestion_decisions(
+    conn: Connection,
+    *,
+    site_id: str,
+    suggestion_id: str,
+) -> List[Dict[str, Any]]:
+    rows = fetch_all(
+        conn,
+        """
+        SELECT
+            id,
+            suggestion_id,
+            site_id,
+            actor_type,
+            actor_ref,
+            decision,
+            original_proposal_hash,
+            decision_payload_json,
+            resulting_hi_revision,
+            failure_detail,
+            occurred_at
+        FROM site_ai_decisions
+        WHERE site_id = :site_id
+          AND suggestion_id = :suggestion_id
+        ORDER BY occurred_at DESC, id DESC
+        """,
+        {
+            "site_id": site_id,
+            "suggestion_id":
+                suggestion_id,
+        },
+    )
+
+    return [
+        aia3_decision_from_row(
+            site_id,
+            row,
+        )
+        for row in rows
+    ]
+
+
+def build_aia3_suggestion_summary(
+    conn: Connection,
+    *,
+    site_id: str,
+    suggestion: Dict[str, Any],
+) -> Dict[str, Any]:
+    evidence = fetch_aia3_evidence_records(
+        conn,
+        site_id=site_id,
+        event_ids=suggestion[
+            "evidence_event_ids"
+        ],
+    )
+
+    evidence_summary = (
+        build_aia3_evidence_summary(
+            stored_event_ids=
+                suggestion[
+                    "evidence_event_ids"
+                ],
+            records=evidence[
+                "records"
+            ],
+            missing_event_ids=
+                evidence[
+                    "missing_event_ids"
+                ],
+        )
+    )
+
+    board_gap = suggestion.get(
+        "board_gap"
+    ) or {}
+
+    proposal = suggestion.get(
+        "proposed_hi_payload"
+    ) or {}
+
+    return {
+        "suggestion_id":
+            suggestion[
+                "suggestion_id"
+            ],
+        "subject_code":
+            suggestion[
+                "subject_code"
+            ],
+        "subject_custom":
+            suggestion.get(
+                "subject_custom"
+            ),
+        "status": suggestion[
+            "status"
+        ],
+        "support_count":
+            evidence_summary[
+                "support_count"
+            ],
+        "hazard_count":
+            evidence_summary[
+                "hazard_count"
+            ],
+        "incident_count":
+            evidence_summary[
+                "incident_count"
+            ],
+        "injury_incident_count":
+            evidence_summary[
+                "injury_incident_count"
+            ],
+        "first_at":
+            evidence_summary[
+                "first_at"
+            ],
+        "last_at":
+            evidence_summary[
+                "last_at"
+            ],
+        "history_complete":
+            suggestion[
+                "history_complete"
+            ],
+        "suggestion_type":
+            suggestion.get(
+                "suggestion_type"
+            ),
+        "board_gap_state":
+            board_gap.get(
+                "state"
+            ),
+        "board_gap_summary":
+            board_gap.get(
+                "summary"
+            ),
+        "hi_revision_at_analysis":
+            suggestion[
+                "hi_revision_at_analysis"
+            ],
+        "proposed_title":
+            proposal.get(
+                "title"
+            ),
+        "generated_at":
+            suggestion[
+                "generated_at"
+            ],
+        "supersedes_suggestion_id":
+            suggestion.get(
+                "supersedes_suggestion_id"
+            ),
+        "evidence_integrity_complete":
+            evidence_summary[
+                "complete"
+            ],
+    }
+
+
+# =========================================================
 # Health
 # =========================================================
 
@@ -9575,6 +10596,395 @@ async def admin_site_ai_generate_suggestion(
                 else 0
             ),
             "decision_write_count": 0,
+        }
+
+
+# =========================================================
+# AIA.3A - Admin Assistant Governed Read Routes
+# =========================================================
+
+@app.get(
+    "/admin/ai/pending-summary"
+)
+async def admin_ai_pending_summary():
+    """
+    Fleet discovery only.
+
+    This is deliberately not a fourth Macro dimension or a global
+    Assistant inbox. It exposes only unresolved Site counts so the
+    existing Site cards may show quiet discovery cognition.
+    """
+    with get_db() as conn:
+        rows = fetch_all(
+            conn,
+            """
+            SELECT
+                s.site_id,
+                COUNT(a.suggestion_id) AS pending_count
+            FROM sites s
+            JOIN site_ai_suggestions a
+              ON a.site_id = s.site_id
+            WHERE a.status = 'pending'
+            GROUP BY s.site_id
+            ORDER BY s.site_id ASC
+            """,
+        )
+
+        sites = [
+            {
+                "site_id": row[
+                    "site_id"
+                ],
+                "pending_count": int(
+                    row[
+                        "pending_count"
+                    ]
+                ),
+            }
+            for row in rows
+        ]
+
+        return {
+            "contract_version":
+                AIA3_ASSISTANT_CONTRACT_VERSION,
+            "total_pending": sum(
+                site[
+                    "pending_count"
+                ]
+                for site in sites
+            ),
+            "sites": sites,
+            "retrieved_at": utc_now_iso(),
+        }
+
+
+@app.get(
+    "/admin/sites/{site_id}/ai/assistant"
+)
+async def admin_site_ai_assistant(
+    site_id: str,
+):
+    """
+    Selected-Site Assistant read snapshot.
+
+    No model invocation, suggestion generation, decision write or H&I
+    authoring occurs here. The route only exposes persisted review work
+    and low-gravity Assistant engine/runtime state.
+    """
+    with get_db() as conn:
+        require_aia_site(
+            conn,
+            site_id,
+        )
+
+        site = fetch_site_summary(
+            conn,
+            site_id,
+        )
+
+        pending = fetch_aia3_site_suggestions(
+            conn,
+            site_id=site_id,
+            status="pending",
+            limit=100,
+        )
+
+        pending_summaries = [
+            build_aia3_suggestion_summary(
+                conn,
+                site_id=site_id,
+                suggestion=suggestion,
+            )
+            for suggestion in pending
+        ]
+
+        recent_rows = fetch_all(
+            conn,
+            aia3_suggestion_select_sql()
+            + """
+              WHERE site_id = :site_id
+                AND status <> 'pending'
+              ORDER BY generated_at DESC,
+                       suggestion_id DESC
+              LIMIT :limit
+            """,
+            {
+                "site_id": site_id,
+                "limit":
+                    AIA3_RECENT_HISTORY_LIMIT,
+            },
+        )
+
+        recent_history = [
+            build_aia3_suggestion_summary(
+                conn,
+                site_id=site_id,
+                suggestion=
+                    aia3_suggestion_from_row(
+                        site_id,
+                        row,
+                    ),
+            )
+            for row in recent_rows
+        ]
+
+        return {
+            "contract_version":
+                AIA3_ASSISTANT_CONTRACT_VERSION,
+            "site_id": site_id,
+            "assist": {
+                "state": "on",
+                "runtime_configured":
+                    aia3_runtime_configured(),
+            },
+            "site": {
+                "operational_state":
+                    site.get(
+                        "operational_state"
+                    ),
+                "status": site.get(
+                    "status"
+                ),
+                "archived": (
+                    site.get(
+                        "operational_state"
+                    ) != "active"
+                ),
+            },
+            "pending_count":
+                len(pending_summaries),
+            "pending":
+                pending_summaries,
+            "recent_history":
+                recent_history,
+            "retrieved_at":
+                utc_now_iso(),
+        }
+
+
+@app.get(
+    "/admin/sites/{site_id}/ai/suggestions/{suggestion_id}"
+)
+async def admin_site_ai_suggestion_detail(
+    site_id: str,
+    suggestion_id: str,
+):
+    """
+    Full read-only review detail for one persisted AIA suggestion.
+
+    Staleness is Backend-owned. The current H&I revision and current
+    deterministic same-subject evidence are compared with the exact
+    truth captured when the suggestion was generated. No suggestion,
+    decision or H&I mutation is created by AIA.3A itself; ordinary H&I
+    lazy expiry remains governed by the existing H&I read law.
+    """
+    with get_db() as conn:
+        site = require_aia_site(
+            conn,
+            site_id,
+        )
+
+        suggestion = fetch_aia3_suggestion(
+            conn,
+            site_id=site_id,
+            suggestion_id=suggestion_id,
+        )
+
+        evidence = fetch_aia3_evidence_records(
+            conn,
+            site_id=site_id,
+            event_ids=suggestion[
+                "evidence_event_ids"
+            ],
+        )
+
+        evidence_summary = (
+            build_aia3_evidence_summary(
+                stored_event_ids=
+                    suggestion[
+                        "evidence_event_ids"
+                    ],
+                records=evidence[
+                    "records"
+                ],
+                missing_event_ids=
+                    evidence[
+                        "missing_event_ids"
+                    ],
+            )
+        )
+
+        current_hi_snapshot = (
+            load_site_hi_snapshot(
+                conn,
+                site_id,
+            )
+        )
+
+        current_subject_state = (
+            aia3_current_subject_state(
+                conn,
+                site_id=site_id,
+                suggestion=suggestion,
+            )
+        )
+
+        staleness = build_aia3_staleness(
+            suggestion=suggestion,
+            current_hi_snapshot=
+                current_hi_snapshot,
+            current_subject_state=
+                current_subject_state,
+            missing_event_ids=
+                evidence[
+                    "missing_event_ids"
+                ],
+            site_operational_state=
+                site.get(
+                    "operational_state"
+                ),
+        )
+
+        decisions = (
+            fetch_aia3_suggestion_decisions(
+                conn,
+                site_id=site_id,
+                suggestion_id=
+                    suggestion_id,
+            )
+        )
+
+        return {
+            "contract_version":
+                AIA3_ASSISTANT_CONTRACT_VERSION,
+            "site_id": site_id,
+            "suggestion": {
+                "suggestion_id":
+                    suggestion[
+                        "suggestion_id"
+                    ],
+                "subject_code":
+                    suggestion[
+                        "subject_code"
+                    ],
+                "subject_custom":
+                    suggestion.get(
+                        "subject_custom"
+                    ),
+                "status": suggestion[
+                    "status"
+                ],
+                "contract_version":
+                    suggestion.get(
+                        "contract_version"
+                    ),
+                "generated_at":
+                    suggestion[
+                        "generated_at"
+                    ],
+                "updated_at":
+                    suggestion[
+                        "updated_at"
+                    ],
+                "suggestion_type":
+                    suggestion.get(
+                        "suggestion_type"
+                    ),
+                "supersedes_suggestion_id":
+                    suggestion.get(
+                        "supersedes_suggestion_id"
+                    ),
+            },
+            "analysis_scope": {
+                "from":
+                    suggestion.get(
+                        "analysis_window_from"
+                    ),
+                "to":
+                    suggestion.get(
+                        "analysis_window_to"
+                    ),
+                "retrieved_at":
+                    suggestion.get(
+                        "retrieved_at"
+                    ),
+                "history_complete":
+                    suggestion[
+                        "history_complete"
+                    ],
+            },
+            "evidence": {
+                **evidence_summary,
+                "event_ids":
+                    suggestion[
+                        "evidence_event_ids"
+                    ],
+                "records": evidence[
+                    "records"
+                ],
+            },
+            "interpretation":
+                suggestion.get(
+                    "interpretation"
+                ),
+            "board_comparison": {
+                "hi_revision_at_analysis":
+                    suggestion[
+                        "hi_revision_at_analysis"
+                    ],
+                "compared_hi_item_ids":
+                    suggestion[
+                        "compared_hi_item_ids"
+                    ],
+                "board_gap":
+                    suggestion.get(
+                        "board_gap"
+                    ),
+                "current_hi_revision":
+                    current_hi_snapshot[
+                        "revision"
+                    ],
+                "current_hi_published_at":
+                    current_hi_snapshot.get(
+                        "published_at"
+                    ),
+            },
+            "proposal":
+                suggestion.get(
+                    "proposed_hi_payload"
+                ),
+            "staleness": staleness,
+            "current_subject": {
+                "complete":
+                    current_subject_state[
+                        "complete"
+                    ],
+                "to":
+                    current_subject_state[
+                        "to"
+                    ],
+                "truncated":
+                    current_subject_state[
+                        "truncated"
+                    ],
+                "pulse":
+                    current_subject_state[
+                        "pulse"
+                    ],
+            },
+            "site": {
+                "operational_state":
+                    site.get(
+                        "operational_state"
+                    ),
+                "archived": (
+                    site.get(
+                        "operational_state"
+                    ) != "active"
+                ),
+            },
+            "decisions": decisions,
+            "retrieved_at": utc_now_iso(),
         }
 
 
