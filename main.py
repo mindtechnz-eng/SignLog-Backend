@@ -1,4 +1,5 @@
 
+
 from __future__ import annotations
 
 import json
@@ -73,6 +74,125 @@ def parse_iso(ts: Optional[str]) -> datetime:
 
     except Exception:
         return datetime.now(timezone.utc)
+
+
+# =========================================================
+# AIA.0 - Hazard / Incident Evidence Semantics
+# =========================================================
+
+AIA0_EVIDENCE_SUBJECT_CODES = frozenset(
+    {
+        "slip_trip_fall",
+        "electrical_live_energy",
+        "work_at_height",
+        "vehicle_plant_traffic",
+        "fire_heat_explosion",
+        "chemical_substance",
+        "biological_health",
+        "manual_handling_ergonomic",
+        "equipment_tooling",
+        "environment_weather",
+        "noise_vibration",
+        "eye_face_flying_particle",
+        "security_behavioural",
+        "access_structural",
+        "other",
+    }
+)
+
+
+def clean_optional_event_text(
+    value: Optional[str],
+) -> Optional[str]:
+    if value is None:
+        return None
+
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def normalise_event_semantics(
+    *,
+    subject_code: Optional[str],
+    subject_custom: Optional[str],
+    title: Optional[str],
+) -> Dict[str, Optional[str]]:
+    """
+    AIA.0 evidence grammar.
+
+    The Kiosk will require subject selection for new field
+    Hazard / Incident reports, while the Backend keeps the
+    fields optional so older clients remain accepted.
+
+    The subject code is deterministic grouping identity only.
+    It does not replace or reinterpret the operator's
+    description. Historic events are never rewritten.
+    """
+    clean_subject_code = (
+        clean_optional_event_text(subject_code)
+        or None
+    )
+
+    if clean_subject_code is not None:
+        clean_subject_code = (
+            clean_subject_code.lower()
+        )
+
+        if (
+            clean_subject_code
+            not in AIA0_EVIDENCE_SUBJECT_CODES
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Invalid subject_code for "
+                    "Hazard / Incident evidence."
+                ),
+            )
+
+    clean_subject_custom = (
+        clean_optional_event_text(
+            subject_custom
+        )
+    )
+
+    if (
+        clean_subject_code is None
+        and clean_subject_custom is not None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "subject_custom requires "
+                "subject_code='other'."
+            ),
+        )
+
+    if clean_subject_code == "other":
+        if not clean_subject_custom:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "A custom Hazard / Incident "
+                    "subject is required when "
+                    "subject_code='other'."
+                ),
+            )
+    else:
+        # Controlled subjects own their display identity.
+        # Custom text must not silently attach to another code.
+        clean_subject_custom = None
+
+    return {
+        "subject_code":
+            clean_subject_code,
+        "subject_custom":
+            clean_subject_custom,
+        "title":
+            clean_optional_event_text(
+                title
+            ),
+    }
 
 
 def parse_query_iso(
@@ -832,6 +952,22 @@ class HazardEventRequest(BaseModel):
     worker_id: Optional[str] = None
     name: Optional[str] = None
 
+    # AIA.0 semantic fields are optional at the Backend
+    # boundary so older Kiosk/API clients remain valid.
+    # The new Kiosk UI will require subject selection.
+    subject_code: Optional[str] = Field(
+        default=None,
+        max_length=80,
+    )
+    subject_custom: Optional[str] = Field(
+        default=None,
+        max_length=120,
+    )
+    title: Optional[str] = Field(
+        default=None,
+        max_length=160,
+    )
+
     description: str = Field(min_length=1)
 
     severity: Literal[
@@ -850,6 +986,20 @@ class IncidentEventRequest(BaseModel):
 
     worker_id: Optional[str] = None
     name: Optional[str] = None
+
+    # Same AIA.0 evidence grammar as Hazard.
+    subject_code: Optional[str] = Field(
+        default=None,
+        max_length=80,
+    )
+    subject_custom: Optional[str] = Field(
+        default=None,
+        max_length=120,
+    )
+    title: Optional[str] = Field(
+        default=None,
+        max_length=160,
+    )
 
     description: str = Field(min_length=1)
 
@@ -4557,6 +4707,18 @@ async def admin_site_events(
                         payload.get(
                             "role"
                         ),
+                    "subject_code":
+                        payload.get(
+                            "subject_code"
+                        ),
+                    "subject_custom":
+                        payload.get(
+                            "subject_custom"
+                        ),
+                    "title":
+                        payload.get(
+                            "title"
+                        ),
                     "description":
                         payload.get(
                             "description"
@@ -5744,11 +5906,21 @@ async def api_hazard(
             payload.timestamp
         ).isoformat()
 
+        semantic_fields = normalise_event_semantics(
+            subject_code=
+                payload.subject_code,
+            subject_custom=
+                payload.subject_custom,
+            title=
+                payload.title,
+        )
+
         event_payload = {
             "worker_id":
                 payload.worker_id,
             "name":
                 payload.name,
+            **semantic_fields,
             "description":
                 payload.description,
             "severity":
@@ -5795,11 +5967,21 @@ async def api_incident(
             payload.timestamp
         ).isoformat()
 
+        semantic_fields = normalise_event_semantics(
+            subject_code=
+                payload.subject_code,
+            subject_custom=
+                payload.subject_custom,
+            title=
+                payload.title,
+        )
+
         event_payload = {
             "worker_id":
                 payload.worker_id,
             "name":
                 payload.name,
+            **semantic_fields,
             "description":
                 payload.description,
             "injury":
@@ -5912,7 +6094,4 @@ async def api_full_headcount(
             "site_id": site_id,
             **state,
         }
-
-
-
-
+        
