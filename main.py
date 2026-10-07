@@ -1,3 +1,5 @@
+
+
 from __future__ import annotations
 
 import json
@@ -4025,6 +4027,793 @@ def aia_json_dumps(
 
 
 # =========================================================
+# AIA.1B - SubjectPulse Deterministic Evidence Preparation
+# =========================================================
+
+AIA_SUBJECT_PULSE_CONTRACT_VERSION = "subject-pulse.v1"
+
+
+def aia_positive_int_env(
+    name: str,
+    default: int,
+) -> int:
+    """
+    Read a positive integer AIA implementation limit without
+    allowing a malformed environment value to stop Backend
+    startup.
+    """
+    raw = os.getenv(
+        name,
+        str(default),
+    )
+
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+
+    return (
+        value
+        if value > 0
+        else default
+    )
+
+
+AIA_SUBJECT_PULSE_MAX_EVENTS = aia_positive_int_env(
+    "AIA_SUBJECT_PULSE_MAX_EVENTS",
+    5000,
+)
+
+AIA_SUBJECT_PULSE_MAX_TITLES = 5
+AIA_SUBJECT_PULSE_MAX_DESCRIPTIONS = 3
+AIA_SUBJECT_PULSE_DESCRIPTION_CHARS = 240
+
+AIA_SUBJECT_PULSE_UNCLASSIFIED_REASONS = (
+    "missing_subject",
+    "invalid_subject",
+    "invalid_other_custom",
+)
+
+AIA_HAZARD_SEVERITY_RANK = {
+    "low": 1,
+    "medium": 2,
+    "high": 3,
+}
+
+
+def aia_clean_text(
+    value: Any,
+) -> Optional[str]:
+    """
+    Safely read human text from historic/raw event payloads.
+
+    AIA.1B must tolerate legacy or malformed payload values
+    without mutating or reinterpreting the underlying event.
+    """
+    if not isinstance(
+        value,
+        str,
+    ):
+        return None
+
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def normalise_aia_subject_custom_key(
+    value: Any,
+) -> Optional[str]:
+    """
+    Deterministic grouping key for AIA.0 `other` subjects.
+
+    Only trim, collapse internal whitespace and case-fold.
+    No punctuation removal, synonym mapping or inference.
+    """
+    cleaned = aia_clean_text(
+        value
+    )
+
+    if cleaned is None:
+        return None
+
+    collapsed = " ".join(
+        cleaned.split()
+    )
+
+    return (
+        collapsed.casefold()
+        or None
+    )
+
+
+def aia_bool(
+    value: Any,
+) -> bool:
+    """
+    Conservative stored injury truth coercion.
+
+    Native JSON boolean True is authoritative. Historic
+    string truth may also be accepted as true/yes/1.
+    """
+    if isinstance(
+        value,
+        bool,
+    ):
+        return value
+
+    if isinstance(
+        value,
+        str,
+    ):
+        return (
+            value.strip().lower()
+            in {
+                "true",
+                "yes",
+                "1",
+            }
+        )
+
+    return False
+
+
+def aia_max_hazard_severity(
+    current: Optional[str],
+    candidate: Any,
+) -> Optional[str]:
+    """
+    Reduce Hazard severity using the controlled order:
+    low < medium < high.
+
+    Blank/unknown values do not create severity.
+    """
+    clean_current = (
+        current.strip().lower()
+        if isinstance(
+            current,
+            str,
+        )
+        else None
+    )
+
+    if (
+        clean_current
+        not in AIA_HAZARD_SEVERITY_RANK
+    ):
+        clean_current = None
+
+    clean_candidate = (
+        candidate.strip().lower()
+        if isinstance(
+            candidate,
+            str,
+        )
+        else None
+    )
+
+    if (
+        clean_candidate
+        not in AIA_HAZARD_SEVERITY_RANK
+    ):
+        return clean_current
+
+    if clean_current is None:
+        return clean_candidate
+
+    if (
+        AIA_HAZARD_SEVERITY_RANK[
+            clean_candidate
+        ]
+        >
+        AIA_HAZARD_SEVERITY_RANK[
+            clean_current
+        ]
+    ):
+        return clean_candidate
+
+    return clean_current
+
+
+def fetch_aia_subject_evidence(
+    conn: Connection,
+    *,
+    site_id: str,
+    from_value: Optional[str],
+    to_value: Optional[str],
+    max_events: int,
+) -> List[Dict[str, Any]]:
+    """
+    Read authoritative Hazard/Incident rows directly from the
+    Backend database.
+
+    cap + 1 is deliberate: the extra row proves that the
+    requested scope exceeds the configured processing ceiling.
+    """
+    sql = """
+        SELECT
+            id,
+            site_id,
+            device_id,
+            event_type,
+            occurred_at,
+            payload_json,
+            created_at
+        FROM events
+        WHERE site_id = :site_id
+          AND event_type IN (
+              'hazard',
+              'incident'
+          )
+    """
+
+    params: Dict[str, Any] = {
+        "site_id": site_id,
+    }
+
+    if from_value is not None:
+        sql += (
+            " AND occurred_at >= "
+            ":from_timestamp"
+        )
+
+        params[
+            "from_timestamp"
+        ] = from_value
+
+    if to_value is not None:
+        sql += (
+            " AND occurred_at <= "
+            ":to_timestamp"
+        )
+
+        params[
+            "to_timestamp"
+        ] = to_value
+
+    sql += """
+        ORDER BY
+            occurred_at ASC,
+            id ASC
+        LIMIT :limit
+    """
+
+    params["limit"] = (
+        max_events + 1
+    )
+
+    return fetch_all(
+        conn,
+        sql,
+        params,
+    )
+
+
+def classify_aia_subject_evidence(
+    payload: Dict[str, Any],
+) -> Dict[str, Optional[str]]:
+    """
+    Classify only explicit AIA.0 subject identity.
+
+    This is not a legacy inference pass. Missing or malformed
+    subject identity is returned as unclassified evidence.
+    """
+    raw_subject = payload.get(
+        "subject_code"
+    )
+
+    if raw_subject is None:
+        return {
+            "group_key": None,
+            "subject_code": None,
+            "subject_custom": None,
+            "reason": "missing_subject",
+        }
+
+    if not isinstance(
+        raw_subject,
+        str,
+    ):
+        return {
+            "group_key": None,
+            "subject_code": None,
+            "subject_custom": None,
+            "reason": "invalid_subject",
+        }
+
+    subject_code = (
+        raw_subject.strip().lower()
+    )
+
+    if not subject_code:
+        return {
+            "group_key": None,
+            "subject_code": None,
+            "subject_custom": None,
+            "reason": "missing_subject",
+        }
+
+    if (
+        subject_code
+        not in AIA0_EVIDENCE_SUBJECT_CODES
+    ):
+        return {
+            "group_key": None,
+            "subject_code": None,
+            "subject_custom": None,
+            "reason": "invalid_subject",
+        }
+
+    if subject_code != "other":
+        return {
+            "group_key": subject_code,
+            "subject_code": subject_code,
+            "subject_custom": None,
+            "reason": None,
+        }
+
+    human_custom = aia_clean_text(
+        payload.get(
+            "subject_custom"
+        )
+    )
+
+    custom_key = (
+        normalise_aia_subject_custom_key(
+            payload.get(
+                "subject_custom"
+            )
+        )
+    )
+
+    if (
+        human_custom is None
+        or custom_key is None
+    ):
+        return {
+            "group_key": None,
+            "subject_code": None,
+            "subject_custom": None,
+            "reason":
+                "invalid_other_custom",
+        }
+
+    return {
+        "group_key":
+            f"other::{custom_key}",
+        "subject_code":
+            "other",
+        "subject_custom":
+            human_custom,
+        "reason":
+            None,
+    }
+
+
+def aia_newest_unique_text(
+    events: List[Dict[str, Any]],
+    *,
+    field_name: str,
+    limit: int,
+    max_chars: Optional[int] = None,
+) -> List[str]:
+    """
+    Return newest-first unique human samples after trimming.
+
+    For descriptions, clipping occurs before output de-duping
+    so the returned bounded samples remain unique.
+    """
+    values: List[str] = []
+    seen = set()
+
+    for event in reversed(
+        events
+    ):
+        payload = event[
+            "payload"
+        ]
+
+        cleaned = aia_clean_text(
+            payload.get(
+                field_name
+            )
+        )
+
+        if cleaned is None:
+            continue
+
+        if (
+            max_chars is not None
+            and len(cleaned) > max_chars
+        ):
+            cleaned = cleaned[
+                :max_chars
+            ]
+
+        if cleaned in seen:
+            continue
+
+        seen.add(cleaned)
+        values.append(cleaned)
+
+        if len(values) >= limit:
+            break
+
+    return values
+
+
+def build_aia_subject_pulses(
+    *,
+    site_id: str,
+    rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Pure deterministic grouping and aggregation.
+
+    Every included event ID may participate in at most one
+    SubjectPulse. Unclassified evidence remains visible in the
+    analysis envelope and is never written back to raw events.
+    """
+    groups: Dict[
+        str,
+        Dict[str, Any],
+    ] = {}
+
+    seen_event_ids = set()
+    unclassified_event_ids: List[int] = []
+    reason_counts: Dict[str, int] = {
+        reason: 0
+        for reason
+        in AIA_SUBJECT_PULSE_UNCLASSIFIED_REASONS
+    }
+
+    for row in rows:
+        event_id = int(
+            row["id"]
+        )
+
+        if event_id in seen_event_ids:
+            continue
+
+        seen_event_ids.add(
+            event_id
+        )
+
+        payload = json_loads(
+            row.get(
+                "payload_json"
+            )
+        )
+
+        classification = (
+            classify_aia_subject_evidence(
+                payload
+            )
+        )
+
+        reason = classification[
+            "reason"
+        ]
+
+        if reason is not None:
+            unclassified_event_ids.append(
+                event_id
+            )
+
+            reason_counts[
+                reason
+            ] = (
+                reason_counts.get(
+                    reason,
+                    0,
+                )
+                + 1
+            )
+
+            continue
+
+        group_key = str(
+            classification[
+                "group_key"
+            ]
+        )
+
+        group = groups.get(
+            group_key
+        )
+
+        if group is None:
+            group = {
+                "site_id": site_id,
+                "subject_code":
+                    classification[
+                        "subject_code"
+                    ],
+                "subject_custom":
+                    classification[
+                        "subject_custom"
+                    ],
+                "events": [],
+                "max_hazard_severity":
+                    None,
+                "injury_incident_count":
+                    0,
+            }
+
+            groups[
+                group_key
+            ] = group
+
+        elif (
+            group[
+                "subject_code"
+            ]
+            == "other"
+            and classification[
+                "subject_custom"
+            ]
+            is not None
+        ):
+            # Keep the newest observed human label for the same
+            # normalized custom identity. Raw evidence is unchanged.
+            group[
+                "subject_custom"
+            ] = classification[
+                "subject_custom"
+            ]
+
+        event_type = str(
+            row["event_type"]
+        ).strip().lower()
+
+        event = {
+            "id": event_id,
+            "event_type": event_type,
+            "occurred_at":
+                row["occurred_at"],
+            "payload": payload,
+        }
+
+        group[
+            "events"
+        ].append(event)
+
+        if event_type == "hazard":
+            group[
+                "max_hazard_severity"
+            ] = (
+                aia_max_hazard_severity(
+                    group[
+                        "max_hazard_severity"
+                    ],
+                    payload.get(
+                        "severity"
+                    ),
+                )
+            )
+
+        if (
+            event_type == "incident"
+            and aia_bool(
+                payload.get(
+                    "injury"
+                )
+            )
+        ):
+            group[
+                "injury_incident_count"
+            ] += 1
+
+    pulses: List[
+        Dict[str, Any]
+    ] = []
+
+    for (
+        group_key,
+        group,
+    ) in groups.items():
+        events = group[
+            "events"
+        ]
+
+        event_ids = [
+            event["id"]
+            for event in events
+        ]
+
+        hazard_count = sum(
+            1
+            for event in events
+            if event[
+                "event_type"
+            ]
+            == "hazard"
+        )
+
+        incident_count = sum(
+            1
+            for event in events
+            if event[
+                "event_type"
+            ]
+            == "incident"
+        )
+
+        pulse = {
+            "site_id":
+                site_id,
+            "subject_code":
+                group[
+                    "subject_code"
+                ],
+            "subject_custom":
+                group[
+                    "subject_custom"
+                ],
+            "event_ids":
+                event_ids,
+            "support_count":
+                len(event_ids),
+            "hazard_count":
+                hazard_count,
+            "incident_count":
+                incident_count,
+            "first_at":
+                (
+                    events[0][
+                        "occurred_at"
+                    ]
+                    if events
+                    else None
+                ),
+            "last_at":
+                (
+                    events[-1][
+                        "occurred_at"
+                    ]
+                    if events
+                    else None
+                ),
+            "max_hazard_severity":
+                group[
+                    "max_hazard_severity"
+                ],
+            "injury_incident_count":
+                group[
+                    "injury_incident_count"
+                ],
+            "titles":
+                aia_newest_unique_text(
+                    events,
+                    field_name="title",
+                    limit=
+                        AIA_SUBJECT_PULSE_MAX_TITLES,
+                ),
+            "sample_descriptions":
+                aia_newest_unique_text(
+                    events,
+                    field_name=
+                        "description",
+                    limit=
+                        AIA_SUBJECT_PULSE_MAX_DESCRIPTIONS,
+                    max_chars=
+                        AIA_SUBJECT_PULSE_DESCRIPTION_CHARS,
+                ),
+            "legacy_inferred_count":
+                0,
+            "_group_key":
+                group_key,
+        }
+
+        pulses.append(
+            pulse
+        )
+
+    # Stable tie-breaking: subject identity ascending inside
+    # last_at descending inside support_count descending.
+    pulses.sort(
+        key=lambda pulse: (
+            pulse["_group_key"]
+        )
+    )
+
+    pulses.sort(
+        key=lambda pulse: (
+            pulse["last_at"]
+            or ""
+        ),
+        reverse=True,
+    )
+
+    pulses.sort(
+        key=lambda pulse: (
+            pulse[
+                "support_count"
+            ]
+        ),
+        reverse=True,
+    )
+
+    for pulse in pulses:
+        pulse.pop(
+            "_group_key",
+            None,
+        )
+
+    ordered_reason_counts = {
+        reason: reason_counts[
+            reason
+        ]
+        for reason
+        in AIA_SUBJECT_PULSE_UNCLASSIFIED_REASONS
+        if reason_counts[
+            reason
+        ] > 0
+    }
+
+    return {
+        "subject_pulses":
+            pulses,
+        "structured_event_count":
+            sum(
+                pulse[
+                    "support_count"
+                ]
+                for pulse in pulses
+            ),
+        "unclassified_evidence": {
+            "count":
+                len(
+                    unclassified_event_ids
+                ),
+            "event_ids":
+                unclassified_event_ids,
+            "reason_counts":
+                ordered_reason_counts,
+            "legacy_inference_applied":
+                False,
+        },
+    }
+
+
+def build_aia_history_scope(
+    *,
+    from_value: Optional[str],
+    to_value: str,
+    retrieved_at: str,
+    relevant_event_count: int,
+    structured_event_count: int,
+    unclassified_event_count: int,
+    event_cap: int,
+    truncated: bool,
+) -> Dict[str, Any]:
+    """
+    Explicit provenance for the deterministic evidence window.
+    """
+    return {
+        "from":
+            from_value,
+        "to":
+            to_value,
+        "complete":
+            not truncated,
+        "retrieved_at":
+            retrieved_at,
+        "relevant_event_count":
+            relevant_event_count,
+        "structured_event_count":
+            structured_event_count,
+        "unclassified_event_count":
+            unclassified_event_count,
+        "event_cap":
+            event_cap,
+        "truncated":
+            truncated,
+        "source":
+            "backend_direct_events",
+    }
+
+
+# =========================================================
 # Health
 # =========================================================
 
@@ -5009,6 +5798,140 @@ async def admin_site_events(
             )
 
         return result
+
+
+# =========================================================
+# AIA.1B - SubjectPulse Read-Only Proof Route
+# =========================================================
+
+@app.get(
+    "/admin/sites/{site_id}/ai/subject-pulse"
+)
+async def admin_site_ai_subject_pulse(
+    site_id: str,
+    from_timestamp: Optional[str] = Query(
+        default=None,
+        alias="from",
+    ),
+    to_timestamp: Optional[str] = Query(
+        default=None,
+        alias="to",
+    ),
+):
+    """
+    Return deterministic Site Hazard/Incident SubjectPulse
+    preparation.
+
+    This route is read-only engineering/Assistant preparation:
+    no suggestion write, no H&I comparison, no H&I mutation
+    and no model invocation.
+    """
+    from_value = parse_query_iso(
+        from_timestamp,
+        "from",
+    )
+
+    requested_to = parse_query_iso(
+        to_timestamp,
+        "to",
+    )
+
+    retrieved_at = utc_now_iso()
+
+    effective_to = (
+        requested_to
+        if requested_to is not None
+        else retrieved_at
+    )
+
+    if (
+        from_value is not None
+        and from_value > effective_to
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid AIA SubjectPulse date range. "
+                "The from timestamp must be earlier "
+                "than or equal to the to timestamp."
+            ),
+        )
+
+    with get_db() as conn:
+        require_aia_generation_site(
+            conn,
+            site_id,
+        )
+
+        rows = fetch_aia_subject_evidence(
+            conn,
+            site_id=site_id,
+            from_value=from_value,
+            to_value=effective_to,
+            max_events=
+                AIA_SUBJECT_PULSE_MAX_EVENTS,
+        )
+
+        truncated = (
+            len(rows)
+            >
+            AIA_SUBJECT_PULSE_MAX_EVENTS
+        )
+
+        included_rows = rows[
+            :AIA_SUBJECT_PULSE_MAX_EVENTS
+        ]
+
+        prepared = (
+            build_aia_subject_pulses(
+                site_id=site_id,
+                rows=included_rows,
+            )
+        )
+
+        unclassified = prepared[
+            "unclassified_evidence"
+        ]
+
+        history_scope = (
+            build_aia_history_scope(
+                from_value=from_value,
+                to_value=effective_to,
+                retrieved_at=
+                    retrieved_at,
+                relevant_event_count=
+                    len(
+                        included_rows
+                    ),
+                structured_event_count=
+                    prepared[
+                        "structured_event_count"
+                    ],
+                unclassified_event_count=
+                    unclassified[
+                        "count"
+                    ],
+                event_cap=
+                    AIA_SUBJECT_PULSE_MAX_EVENTS,
+                truncated=
+                    truncated,
+            )
+        )
+
+        return {
+            "contract_version":
+                AIA_SUBJECT_PULSE_CONTRACT_VERSION,
+            "site_id":
+                site_id,
+            "history_scope":
+                history_scope,
+            "subject_pulses":
+                prepared[
+                    "subject_pulses"
+                ],
+            "unclassified_evidence":
+                unclassified,
+        }
 
 
 # =========================================================
