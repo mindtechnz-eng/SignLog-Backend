@@ -6729,10 +6729,27 @@ def aia2_emergency_gate(
         site.get("sos_active")
     )
 
+    active_count = int(
+        site.get("active_count")
+        or 0
+    )
+
+    full_headcount_confirmed = bool(
+        site.get(
+            "full_headcount_confirmed"
+        )
+    )
+
+    crisis_attention = (
+        in_active_crisis_area
+        and active_count > 0
+        and not full_headcount_confirmed
+    )
+
     return {
         "deferred": (
             sos_active
-            or in_active_crisis_area
+            or crisis_attention
         ),
         "sos_active": sos_active,
         "in_active_crisis_area":
