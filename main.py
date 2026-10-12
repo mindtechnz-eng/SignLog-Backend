@@ -877,6 +877,215 @@ def ensure_site_ai_schema(
 
 
 # =========================================================
+# NZ-NCM N1A - Event evidence persistence foundation
+# Controlled additive preparation; NO projection or route changes.
+# All new event data remain empty/unasserted until N1B.
+# =========================================================
+
+NCM_EVENT_SCHEMA_VERSION = "n1a.1"
+
+
+def ensure_ncm_event_schema(
+    conn: Connection,
+) -> None:
+    """Provision append-oriented crisis evidence structures.
+
+    Requires the existing `crises`, `sites`, `events` tables, so
+    init_db() invokes this AFTER those legacy CREATE TABLE calls.
+    Does not backfill event timelines, open response tracks,
+    change live crisis interpretation, or expose new endpoints.
+    Re-entry is safe on supported PostgreSQL/SQLite databases.
+    """
+    crisis_additions = (
+        ("event_category", "TEXT"),
+        ("intensity", "TEXT"),
+        ("response_required", "INTEGER"),
+        ("source_reference", "TEXT"),
+        ("source_approved_at", "TEXT"),
+        ("source_approved_by", "TEXT"),
+        ("source_issued_at", "TEXT"),
+        ("effective_from", "TEXT"),
+        ("effective_until", "TEXT"),
+        # Zero means no proven event revision, including legacy
+        # records and new crises created through the old routes.
+        ("event_revision", "INTEGER NOT NULL DEFAULT 0"),
+        # Archive is a separate later action, not a legacy status.
+        ("archived_at", "TEXT"),
+    )
+    for name, column_definition in crisis_additions:
+        add_column_if_missing(
+            conn, "crises", name, column_definition
+        )
+
+    # History rows are append-only BY APPLICATION POLICY (N1B);
+    # database permissions/trigger enforcement remain future gates.
+    execute_write(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS crisis_event_revisions (
+            revision_id TEXT PRIMARY KEY,
+            crisis_id TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            geometry_json TEXT NOT NULL,
+            classification_json TEXT NOT NULL,
+            source_json TEXT NOT NULL,
+            policy_json TEXT NOT NULL,
+            effective_from TEXT,
+            effective_until TEXT,
+            snapshot_json TEXT NOT NULL,
+            actor_type TEXT NOT NULL,
+            actor_ref TEXT,
+            recorded_at TEXT NOT NULL,
+            UNIQUE(crisis_id, revision),
+            FOREIGN KEY(crisis_id) REFERENCES crises(crisis_id)
+        )
+        """,
+    )
+    execute_write(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS crisis_site_membership_intervals (
+            interval_id TEXT PRIMARY KEY,
+            crisis_id TEXT NOT NULL,
+            site_id TEXT NOT NULL,
+            scope_revision INTEGER NOT NULL,
+            membership_state TEXT NOT NULL CHECK(
+                membership_state IN ('in_area','outside','unknown')
+            ),
+            site_latitude REAL,
+            site_longitude REAL,
+            company_name_snapshot TEXT,
+            entered_at TEXT NOT NULL,
+            exited_at TEXT,
+            basis TEXT NOT NULL,
+            evidence_status TEXT NOT NULL CHECK(
+                evidence_status IN ('complete','partial','unknown')
+            ),
+            unknown_reason TEXT,
+            projector_version TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            FOREIGN KEY(crisis_id) REFERENCES crises(crisis_id),
+            FOREIGN KEY(site_id) REFERENCES sites(site_id)
+        )
+        """,
+    )
+    execute_write(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS crisis_site_exposure_intervals (
+            interval_id TEXT PRIMARY KEY,
+            crisis_id TEXT NOT NULL,
+            site_id TEXT NOT NULL,
+            membership_interval_id TEXT,
+            started_at TEXT NOT NULL,
+            ended_at TEXT,
+            occupancy_event_ids_json TEXT NOT NULL,
+            basis TEXT NOT NULL,
+            evidence_status TEXT NOT NULL CHECK(
+                evidence_status IN ('complete','partial','unknown')
+            ),
+            projector_version TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            FOREIGN KEY(crisis_id) REFERENCES crises(crisis_id),
+            FOREIGN KEY(site_id) REFERENCES sites(site_id),
+            FOREIGN KEY(membership_interval_id) REFERENCES
+                crisis_site_membership_intervals(interval_id)
+        )
+        """,
+    )
+    execute_write(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS crisis_site_response_intervals (
+            interval_id TEXT PRIMARY KEY,
+            crisis_id TEXT NOT NULL,
+            site_id TEXT NOT NULL,
+            response_state TEXT NOT NULL CHECK(
+                response_state IN ('orange','red','green')
+            ),
+            started_at TEXT NOT NULL,
+            ended_at TEXT,
+            source_event_id INTEGER,
+            observed_at TEXT,
+            received_at TEXT,
+            cause TEXT NOT NULL,
+            attribution_json TEXT NOT NULL,
+            evidence_status TEXT NOT NULL CHECK(
+                evidence_status IN ('complete','partial','unknown')
+            ),
+            scope_revision INTEGER NOT NULL,
+            projector_version TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            FOREIGN KEY(crisis_id) REFERENCES crises(crisis_id),
+            FOREIGN KEY(site_id) REFERENCES sites(site_id),
+            FOREIGN KEY(source_event_id) REFERENCES events(id)
+        )
+        """,
+    )
+    execute_write(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS crisis_audit_actions (
+            action_id TEXT PRIMARY KEY,
+            crisis_id TEXT NOT NULL,
+            action_type TEXT NOT NULL,
+            actor_type TEXT NOT NULL,
+            actor_ref TEXT,
+            reason TEXT,
+            before_revision INTEGER,
+            after_revision INTEGER,
+            request_id TEXT,
+            action_payload_json TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            FOREIGN KEY(crisis_id) REFERENCES crises(crisis_id)
+        )
+        """,
+    )
+    execute_write(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS crisis_projection_state (
+            crisis_id TEXT NOT NULL,
+            site_id TEXT NOT NULL,
+            projector_version TEXT NOT NULL,
+            projection_revision INTEGER NOT NULL DEFAULT 0,
+            last_source_event_id INTEGER,
+            source_watermark_at TEXT,
+            reprojected_at TEXT,
+            evidence_status TEXT NOT NULL DEFAULT 'unknown'
+                CHECK(evidence_status IN ('complete','partial','unknown')),
+            repair_state TEXT NOT NULL DEFAULT 'not_started',
+            PRIMARY KEY(crisis_id, site_id),
+            FOREIGN KEY(crisis_id) REFERENCES crises(crisis_id),
+            FOREIGN KEY(site_id) REFERENCES sites(site_id)
+        )
+        """,
+    )
+
+    # Indexes are intentionally conservative and cross-engine.
+    for sql in (
+        """CREATE INDEX IF NOT EXISTS idx_crisis_event_revisions_crisis
+           ON crisis_event_revisions(crisis_id, revision)""",
+        """CREATE INDEX IF NOT EXISTS idx_crisis_member_crisis_site_time
+           ON crisis_site_membership_intervals(
+              crisis_id, site_id, entered_at)""",
+        """CREATE INDEX IF NOT EXISTS idx_crisis_exposure_crisis_site_time
+           ON crisis_site_exposure_intervals(
+              crisis_id, site_id, started_at)""",
+        """CREATE INDEX IF NOT EXISTS idx_crisis_response_crisis_site_time
+           ON crisis_site_response_intervals(
+              crisis_id, site_id, started_at)""",
+        """CREATE INDEX IF NOT EXISTS idx_crisis_response_source_event
+           ON crisis_site_response_intervals(source_event_id)""",
+        """CREATE INDEX IF NOT EXISTS idx_crisis_audit_crisis_recorded
+           ON crisis_audit_actions(crisis_id, recorded_at)""",
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_crisis_audit_request
+           ON crisis_audit_actions(crisis_id, request_id)""",
+    ):
+        execute_write(conn, sql)
+
+
+# =========================================================
 # Database Init
 # =========================================================
 
@@ -1053,6 +1262,11 @@ def init_db() -> None:
                 """
             )
         )
+
+        # N1A additive schema only. The legacy crisis creation,
+        # clearance, live-state routes and field-event writes are
+        # intentionally untouched in this cut.
+        ensure_ncm_event_schema(conn)
 
 
 @app.on_event("startup")
@@ -1913,7 +2127,10 @@ def list_active_crises(
     return fetch_all(
         conn,
         """
-        SELECT *
+        SELECT
+            crisis_id, source, crisis_class, hazard_type, name,
+            status, center_latitude, center_longitude, radius_km,
+            created_at, updated_at, cleared_at
         FROM crises
         WHERE status = 'active'
         ORDER BY created_at DESC
