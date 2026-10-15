@@ -2287,6 +2287,61 @@ def site_in_any_active_crisis(
     return False
 
 
+def ncm_crisis_attention_clock(value: Any) -> Optional[datetime]:
+    """Interpret existing stored evidence times without inventing defaults.
+
+    A missing, malformed, or timezone-naive clock cannot certify that an FHC
+    happened *after* a new recorded crisis-response window began.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        return None
+
+
+def ncm_current_crisis_attention(
+    site: Dict[str, Any], crises: List[Dict[str, Any]],
+) -> tuple[bool, bool]:
+    """LC-1: same NON-MUTATING operational attention for NCM, Kiosk and AIA.
+
+    Returns (in_current_crisis_radius, occupied_crisis_response_pending).
+    The current geometry and crisis creation clock are attention proxies ONLY:
+    neither establishes event-specific SOS/FHC attribution or a hazard onset.
+    One fresh FHC may satisfy the aggregate Site headcount attention for the
+    current intersecting windows; no named crisis response link is created.
+    """
+    matched = [
+        crisis for crisis in crises
+        if crisis.get("status") == "active"
+        and site_in_any_active_crisis(site, [crisis])
+    ]
+    if not matched:
+        return False, False
+
+    if int(site.get("active_count") or 0) <= 0:
+        return True, False
+
+    if not bool(site.get("full_headcount_confirmed")):
+        return True, True
+
+    fhc_at = ncm_crisis_attention_clock(site.get("last_full_headcount_at"))
+    now = datetime.now(timezone.utc)
+    if fhc_at is None or fhc_at > now:
+        return True, True
+
+    for crisis in matched:
+        response_window = ncm_crisis_attention_clock(crisis.get("created_at"))
+        if response_window is None or response_window > now or fhc_at <= response_window:
+            return True, True
+
+    return True, False
+
+
 # =========================================================
 # H&I - Authoritative Domain Helpers (HI.1 + HI.2)
 # =========================================================
@@ -7043,33 +7098,16 @@ def aia2_emergency_gate(
         conn
     )
 
-    in_active_crisis_area = (
-        site_in_any_active_crisis(
-            site,
-            crises,
-        )
+    in_active_crisis_area, crisis_attention = (
+        ncm_current_crisis_attention(site, crises)
     )
 
     sos_active = bool(
         site.get("sos_active")
     )
 
-    active_count = int(
-        site.get("active_count")
-        or 0
-    )
-
-    full_headcount_confirmed = bool(
-        site.get(
-            "full_headcount_confirmed"
-        )
-    )
-
-    crisis_attention = (
-        in_active_crisis_area
-        and active_count > 0
-        and not full_headcount_confirmed
-    )
+    # LC-1: freshness assessed once against every intersecting active crisis.
+    # No alteration to Site SOS/FHC source events or AIA response contract.
 
     return {
         "deferred": (
@@ -13058,11 +13096,8 @@ async def ncm_sites():
         )
 
         for site in rows:
-            in_crisis_area = (
-                site_in_any_active_crisis(
-                    site,
-                    crises,
-                )
+            in_crisis_area, crisis_attention = (
+                ncm_current_crisis_attention(site, crises)
             )
 
             ncm_state = None
@@ -13074,16 +13109,7 @@ async def ncm_sites():
                 ncm_state = "red"
                 priority = 1
 
-            elif (
-                in_crisis_area
-                and site.get(
-                    "active_count",
-                    0,
-                ) > 0
-                and not site.get(
-                    "full_headcount_confirmed"
-                )
-            ):
+            elif crisis_attention:
                 ncm_state = "orange"
                 priority = 2
 
@@ -13192,9 +13218,8 @@ async def kiosk_bootstrap(
         normalise_site_display_policy_fields(site)
 
         crises = list_active_crises(conn)
-        in_crisis_area = site_in_any_active_crisis(
-            site,
-            crises,
+        in_crisis_area, crisis_attention = (
+            ncm_current_crisis_attention(site, crises)
         )
 
         active_count = int(site.get("active_count") or 0)
@@ -13207,11 +13232,7 @@ async def kiosk_bootstrap(
 
         if sos_active:
             ncm_state = "red"
-        elif (
-            in_crisis_area
-            and active_count > 0
-            and not fhc_confirmed
-        ):
+        elif crisis_attention:
             ncm_state = "orange"
         elif fhc_confirmed:
             ncm_state = "green"
@@ -13831,3 +13852,5 @@ async def ncm_internal_archive_crisis(crisis_id: str, payload: NcmArchiveRequest
               "payload": json.dumps({"basis": "archived_after_crisis_clearance", "raw_events_deleted": False}),
               "now": now})
     return {"status": "archived", "crisis_id": crisis_id, "archived_at": now}
+
+
