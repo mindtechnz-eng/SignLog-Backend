@@ -1086,6 +1086,201 @@ def ensure_ncm_event_schema(
 
 
 # =========================================================
+# NZ-NCM N1B-R2A - minimal evidence attribution preparation
+# Governing spec SL-NCM-CUT-N1-001 v1.1.
+# These helpers never replace SOS/FHC or site-status authority.
+# =========================================================
+
+NCM_DIRECT_SOS_SOURCES = frozenset({"digital_sos", "physical_sos"})
+NCM_AWARENESS_SOS_SOURCES = frozenset({"awareness_sos"})
+NCM_KNOWN_SIGNAL_SOURCES = {
+    "sos": NCM_DIRECT_SOS_SOURCES | NCM_AWARENESS_SOS_SOURCES,
+    "full_headcount": frozenset({"digital_fhc", "physical_fhc", "awareness_fhc"}),
+}
+
+
+def ncm_capture_signal_source(event_type: str, reported_source: Any) -> Dict[str, Any]:
+    """Record optional Kiosk source as a *claim*, not crisis attribution.
+
+    No database lookup or projector runs inside the emergency write path.
+    Older callers omitting source still produce the original raw event.
+    """
+    known = NCM_KNOWN_SIGNAL_SOURCES.get(event_type, frozenset())
+    if isinstance(reported_source, str) and reported_source in known:
+        return {"source": reported_source, "source_evidence": "kiosk_claim"}
+    if reported_source is None:
+        return {"source": None, "source_evidence": "not_supplied"}
+    return {"source": None, "source_evidence": "unrecognised_claim"}
+
+
+def ncm_strict_event_time(value: Any) -> datetime:
+    """Strict UTC parsing for derived evidence; NEVER substitute now()."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("NZ-NCM event is missing a valid occurred_at timestamp")
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError("NZ-NCM event has invalid occurred_at timestamp") from error
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def ncm_interpret_site_sos_episodes(
+    site_id: str, event_rows: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Pure, deterministic SOS-to-FHC *signal episode* interpretation.
+
+    Each raw event appears once in source truth. The stable case identifier is
+    derived from the first SOS event id. Repeated SOS stays in the same case;
+    the next chronological FHC closes the *signal*, not any physical hazard.
+    An awareness source is NOT evidence of a particular crisis_id, and even a
+    direct source is NOT proof the SOS was unrelated to a nearby crisis.
+    No mutable Site state, crisis table or projection table is written here.
+    """
+    ordered: List[tuple[datetime, int, Dict[str, Any]]] = []
+    for row in event_rows:
+        if row.get("event_type") not in {"sos", "full_headcount"}:
+            continue
+        event_id = row.get("id")
+        if not isinstance(event_id, int) or event_id < 1:
+            raise ValueError("NZ-NCM episode source has invalid event ID")
+        if row.get("site_id") not in (None, site_id):
+            raise ValueError("NZ-NCM episode source belongs to another Site")
+        ordered.append((ncm_strict_event_time(row.get("occurred_at")), event_id, row))
+    ordered.sort(key=lambda item: (item[0], item[1]))
+    if len({event_id for _, event_id, _ in ordered}) != len(ordered):
+        raise ValueError("NZ-NCM episode source includes duplicate raw event IDs")
+
+    cases: List[Dict[str, Any]] = []
+    open_case: Optional[Dict[str, Any]] = None
+    for event_time, event_id, row in ordered:
+        payload = json_loads(row.get("payload_json"))
+        source = payload.get("source")
+        evidence = payload.get("source_evidence", "legacy_unknown")
+        if row["event_type"] == "sos":
+            if open_case is None:
+                origin = (
+                    "direct_site_interface"
+                    if source in NCM_DIRECT_SOS_SOURCES
+                    else "awareness_interface_unattributed"
+                    if source in NCM_AWARENESS_SOS_SOURCES
+                    else "unknown"
+                )
+                open_case = {
+                    "episode_id": str(uuid5(NAMESPACE_URL, f"signlog:ncm:sos:{site_id}:{event_id}")),
+                    "site_id": site_id,
+                    "opening_sos_event_id": event_id,
+                    "sos_started_at": event_time.isoformat(),
+                    "closed_by_fhc_event_id": None,
+                    "signal_closed_at": None,
+                    "signal_status": "open",
+                    "origin_interface": origin,
+                    "crisis_attribution": "not_determined",
+                    "sos_event_ids": [],
+                    "evidence_event_ids": [],
+                    "evidence_status": "partial",
+                    "source_claim_present": evidence == "kiosk_claim",
+                    "meaning": "signal_episode_not_hazard_resolution",
+                }
+            open_case["sos_event_ids"].append(event_id)
+            open_case["evidence_event_ids"].append(event_id)
+            if evidence != "kiosk_claim":
+                open_case["evidence_status"] = "partial"
+            continue
+        if open_case is not None:
+            open_case["closed_by_fhc_event_id"] = event_id
+            open_case["signal_closed_at"] = event_time.isoformat()
+            open_case["signal_status"] = "signal_closed"
+            open_case["evidence_event_ids"].append(event_id)
+            if evidence != "kiosk_claim":
+                open_case["evidence_status"] = "partial"
+            cases.append(open_case)
+            open_case = None
+    if open_case is not None:
+        cases.append(open_case)
+    return cases
+
+
+def ncm_record_crisis_creation_evidence(
+    conn: Connection, crisis_id: str, payload: "CreateCrisisRequest", created_at: str,
+) -> None:
+    """Capture the first *new* crisis revision in existing N1A storage.
+
+    Earlier revision-zero crises are never retrospectively reinterpreted.
+    A manual create timestamp is NOT an external weather-advisory issue time.
+    Crisis geometry is recorded, not automatically classified as staffed
+    exposure or an SOS/FHC attribution. This is on the operator creation path,
+    never the critical Kiosk SOS/FHC path.
+    """
+    geometry = {"center_latitude": payload.center_latitude,
+                "center_longitude": payload.center_longitude,
+                "radius_km": payload.radius_km}
+    classification = {"crisis_class": payload.crisis_class,
+                      "hazard_type": payload.hazard_type, "name": payload.name}
+    source = {"declared_source": payload.source, "official_source_verified": False,
+              "basis": "existing_admin_crisis_creation_route"}
+    policy = {"response_required": None,
+              "meaning": "not_yet_authorised_for_event_specific_AS_or_FHC"}
+    snapshot = {"crisis_id": crisis_id, "event_revision": 1,
+                "recorded_at": created_at, "geometry": geometry,
+                "classification": classification, "source": source,
+                "policy": policy, "effective_from": created_at,
+                "effective_basis": "backend_crisis_creation_time"}
+    execute_write(conn, """
+        UPDATE crises SET event_revision = 1, effective_from = :created_at
+        WHERE crisis_id = :crisis_id AND event_revision = 0
+    """, {"crisis_id": crisis_id, "created_at": created_at})
+    execute_write(conn, """
+        INSERT INTO crisis_event_revisions (
+            revision_id, crisis_id, revision, geometry_json,
+            classification_json, source_json, policy_json,
+            effective_from, effective_until, snapshot_json,
+            actor_type, actor_ref, recorded_at
+        ) VALUES (
+            :revision_id, :crisis_id, 1, :geometry, :classification,
+            :source, :policy, :created_at, NULL, :snapshot,
+            'legacy_admin_route', NULL, :created_at
+        )
+    """, {"revision_id": str(uuid4()), "crisis_id": crisis_id,
+          "geometry": json.dumps(geometry), "classification": json.dumps(classification),
+          "source": json.dumps(source), "policy": json.dumps(policy),
+          "created_at": created_at, "snapshot": json.dumps(snapshot)})
+    execute_write(conn, """
+        INSERT INTO crisis_audit_actions (
+            action_id, crisis_id, action_type, actor_type, actor_ref,
+            reason, before_revision, after_revision, request_id,
+            action_payload_json, recorded_at
+        ) VALUES (
+            :action_id, :crisis_id, 'create', 'legacy_admin_route', NULL,
+            NULL, 0, 1, NULL, :audit_payload, :created_at
+        )
+    """, {"action_id": str(uuid4()), "crisis_id": crisis_id,
+          "audit_payload": json.dumps({"basis": "admin_crisis_create", "snapshot_revision": 1}),
+          "created_at": created_at})
+
+
+def ncm_record_crisis_clear_evidence(
+    conn: Connection, crisis_id: str, cleared_at: str,
+) -> None:
+    """Audit legacy clearance without erasing Site/FHC evidence."""
+    row = fetch_one(conn, "SELECT event_revision FROM crises WHERE crisis_id = :id", {"id": crisis_id})
+    revision = int(row["event_revision"]) if row else 0
+    execute_write(conn, """
+        INSERT INTO crisis_audit_actions (
+            action_id, crisis_id, action_type, actor_type, actor_ref,
+            reason, before_revision, after_revision, request_id,
+            action_payload_json, recorded_at
+        ) VALUES (
+            :action_id, :crisis_id, 'clear', 'legacy_admin_route', NULL,
+            NULL, :revision, :revision, NULL, :payload, :cleared_at
+        )
+    """, {"action_id": str(uuid4()), "crisis_id": crisis_id,
+          "revision": revision, "cleared_at": cleared_at,
+          "payload": json.dumps({"basis": "admin_crisis_clear", "signal_resolution_claimed": False})})
+
+
+# =========================================================
 # Database Init
 # =========================================================
 
@@ -1419,6 +1614,8 @@ class SOSEventRequest(BaseModel):
 
     timestamp: Optional[str] = None
     note: Optional[str] = None
+    # Optional caller-declared source; the Backend never treats it as authority.
+    source: Any = None
 
 
 class FullHeadcountEventRequest(BaseModel):
@@ -1428,6 +1625,7 @@ class FullHeadcountEventRequest(BaseModel):
 
     timestamp: Optional[str] = None
     note: Optional[str] = None
+    source: Any = None
 
 
 class CreateCrisisRequest(BaseModel):
@@ -12840,6 +13038,10 @@ async def admin_create_crisis(
             },
         )
 
+        # N1B-R2A: first captured crisis revision, using N1A storage.
+        # No Site response or historic membership is inferred here.
+        ncm_record_crisis_creation_evidence(conn, crisis_id, payload, now)
+
         return {
             "status": "ok",
             "crisis_id": crisis_id,
@@ -12892,6 +13094,9 @@ async def admin_clear_crisis(
                     crisis_id,
             },
         )
+
+        # N1B-R2A: record clearance without changing Site FHC/SOS.
+        ncm_record_crisis_clear_evidence(conn, crisis_id, now)
 
         return {
             "status": "ok",
@@ -13465,6 +13670,7 @@ async def api_sos(
                 occurred_at,
             payload={
                 "note": payload.note,
+                **ncm_capture_signal_source("sos", payload.source),
             },
         )
 
@@ -13507,6 +13713,7 @@ async def api_full_headcount(
                 occurred_at,
             payload={
                 "note": payload.note,
+                **ncm_capture_signal_source("full_headcount", payload.source),
             },
         )
 
