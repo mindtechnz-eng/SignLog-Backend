@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
+import secrets
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from math import radians, sin, cos, sqrt, atan2
@@ -15,7 +16,7 @@ from urllib import request as urllib_request
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, inspect, text
@@ -1086,15 +1087,13 @@ def ensure_ncm_event_schema(
 
 
 # =========================================================
-# NZ-NCM N1B-R2A - minimal evidence attribution preparation
-# Governing spec SL-NCM-CUT-N1-001 v1.1.
+# NZ-NCM - minimal event source and crisis lifecycle evidence capture
+# One Backend authority; interpretation and reporting belong to NZ-NCM.
 # These helpers never replace SOS/FHC or site-status authority.
 # =========================================================
 
-NCM_DIRECT_SOS_SOURCES = frozenset({"digital_sos", "physical_sos"})
-NCM_AWARENESS_SOS_SOURCES = frozenset({"awareness_sos"})
 NCM_KNOWN_SIGNAL_SOURCES = {
-    "sos": NCM_DIRECT_SOS_SOURCES | NCM_AWARENESS_SOS_SOURCES,
+    "sos": frozenset({"digital_sos", "physical_sos", "awareness_sos"}),
     "full_headcount": frozenset({"digital_fhc", "physical_fhc", "awareness_fhc"}),
 }
 
@@ -1111,95 +1110,6 @@ def ncm_capture_signal_source(event_type: str, reported_source: Any) -> Dict[str
     if reported_source is None:
         return {"source": None, "source_evidence": "not_supplied"}
     return {"source": None, "source_evidence": "unrecognised_claim"}
-
-
-def ncm_strict_event_time(value: Any) -> datetime:
-    """Strict UTC parsing for derived evidence; NEVER substitute now()."""
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("NZ-NCM event is missing a valid occurred_at timestamp")
-    try:
-        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-    except ValueError as error:
-        raise ValueError("NZ-NCM event has invalid occurred_at timestamp") from error
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
-def ncm_interpret_site_sos_episodes(
-    site_id: str, event_rows: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """Pure, deterministic SOS-to-FHC *signal episode* interpretation.
-
-    Each raw event appears once in source truth. The stable case identifier is
-    derived from the first SOS event id. Repeated SOS stays in the same case;
-    the next chronological FHC closes the *signal*, not any physical hazard.
-    An awareness source is NOT evidence of a particular crisis_id, and even a
-    direct source is NOT proof the SOS was unrelated to a nearby crisis.
-    No mutable Site state, crisis table or projection table is written here.
-    """
-    ordered: List[tuple[datetime, int, Dict[str, Any]]] = []
-    for row in event_rows:
-        if row.get("event_type") not in {"sos", "full_headcount"}:
-            continue
-        event_id = row.get("id")
-        if not isinstance(event_id, int) or event_id < 1:
-            raise ValueError("NZ-NCM episode source has invalid event ID")
-        if row.get("site_id") not in (None, site_id):
-            raise ValueError("NZ-NCM episode source belongs to another Site")
-        ordered.append((ncm_strict_event_time(row.get("occurred_at")), event_id, row))
-    ordered.sort(key=lambda item: (item[0], item[1]))
-    if len({event_id for _, event_id, _ in ordered}) != len(ordered):
-        raise ValueError("NZ-NCM episode source includes duplicate raw event IDs")
-
-    cases: List[Dict[str, Any]] = []
-    open_case: Optional[Dict[str, Any]] = None
-    for event_time, event_id, row in ordered:
-        payload = json_loads(row.get("payload_json"))
-        source = payload.get("source")
-        evidence = payload.get("source_evidence", "legacy_unknown")
-        if row["event_type"] == "sos":
-            if open_case is None:
-                origin = (
-                    "direct_site_interface"
-                    if source in NCM_DIRECT_SOS_SOURCES
-                    else "awareness_interface_unattributed"
-                    if source in NCM_AWARENESS_SOS_SOURCES
-                    else "unknown"
-                )
-                open_case = {
-                    "episode_id": str(uuid5(NAMESPACE_URL, f"signlog:ncm:sos:{site_id}:{event_id}")),
-                    "site_id": site_id,
-                    "opening_sos_event_id": event_id,
-                    "sos_started_at": event_time.isoformat(),
-                    "closed_by_fhc_event_id": None,
-                    "signal_closed_at": None,
-                    "signal_status": "open",
-                    "origin_interface": origin,
-                    "crisis_attribution": "not_determined",
-                    "sos_event_ids": [],
-                    "evidence_event_ids": [],
-                    "evidence_status": "partial",
-                    "source_claim_present": evidence == "kiosk_claim",
-                    "meaning": "signal_episode_not_hazard_resolution",
-                }
-            open_case["sos_event_ids"].append(event_id)
-            open_case["evidence_event_ids"].append(event_id)
-            if evidence != "kiosk_claim":
-                open_case["evidence_status"] = "partial"
-            continue
-        if open_case is not None:
-            open_case["closed_by_fhc_event_id"] = event_id
-            open_case["signal_closed_at"] = event_time.isoformat()
-            open_case["signal_status"] = "signal_closed"
-            open_case["evidence_event_ids"].append(event_id)
-            if evidence != "kiosk_claim":
-                open_case["evidence_status"] = "partial"
-            cases.append(open_case)
-            open_case = None
-    if open_case is not None:
-        cases.append(open_case)
-    return cases
 
 
 def ncm_record_crisis_creation_evidence(
@@ -1279,320 +1189,6 @@ def ncm_record_crisis_clear_evidence(
           "revision": revision, "cleared_at": cleared_at,
           "payload": json.dumps({"basis": "admin_crisis_clear", "signal_resolution_claimed": False})})
 
-
-# =========================================================
-# NZ-NCM N1B-R2B - event-specific geographic evidence projector
-# Governing spec SL-NCM-N1B-R2B-001 v1.0 (Option A: PURE).
-# Deliberately no database writes, public routes, or emergency hooks.
-# =========================================================
-
-NCM_R2B_PROJECTOR_VERSION = "n1b-r2b.pure.1"
-
-
-def ncm_r2b_iso(value: Any, field: str) -> datetime:
-    """Reject absent, invalid, and timezone-ambiguous derivation inputs."""
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"R2B {field} requires a nonempty ISO timestamp")
-    try:
-        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ValueError(f"R2B {field} is not valid ISO time") from exc
-    if parsed.tzinfo is None:
-        raise ValueError(f"R2B {field} requires an explicit UTC offset")
-    return parsed.astimezone(timezone.utc)
-
-
-def ncm_r2b_number(value: Any, field: str, low: float, high: float) -> float:
-    """Validate coordinates/radius; bool and NaN are never observations."""
-    from math import isfinite
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"R2B {field} must be a finite number")
-    if not isfinite(value) or not low <= value <= high:
-        raise ValueError(f"R2B {field} outside permitted range")
-    return float(value)
-
-
-def ncm_r2b_json_object(value: Any, field: str) -> Dict[str, Any]:
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        try:
-            decoded = json.loads(value)
-        except (ValueError, TypeError) as exc:
-            raise ValueError(f"R2B {field} contains invalid JSON") from exc
-        if isinstance(decoded, dict):
-            return decoded
-    raise ValueError(f"R2B {field} must contain an object")
-
-
-def ncm_r2b_segments(spans: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Coalesce only adjacent intervals with identical evidence semantics."""
-    merged: List[Dict[str, Any]] = []
-    for span in spans:
-        if merged and merged[-1]["ended_at"] == span["started_at"]:
-            earlier = dict(merged[-1]); later = dict(span)
-            earlier.pop("ended_at"); later.pop("ended_at")
-            earlier.pop("duration_seconds", None); later.pop("duration_seconds", None)
-            earlier.pop("started_at"); later.pop("started_at")
-            if earlier == later:
-                merged[-1]["ended_at"] = span["ended_at"]
-                merged[-1]["duration_seconds"] += span["duration_seconds"]
-                continue
-        merged.append(span)
-    return merged
-
-
-def ncm_r2b_project_crisis_site(
-    *,
-    crisis: Dict[str, Any],
-    revisions: List[Dict[str, Any]],
-    site_id: str,
-    as_of: str,
-    location_windows: List[Dict[str, Any]],
-    events: List[Dict[str, Any]],
-    occupancy_baseline: Optional[Dict[str, Any]] = None,
-    sign_history_complete: bool = False,
-) -> Dict[str, Any]:
-    """Derive one (crisis, Site) geographic evidence envelope, without mutation.
-
-    location_windows are NOT rows from the mutable sites table. They must be
-    independently evidenced effective windows with explicit bounded from/until,
-    observation_id and evidence_basis. A single location sighting is insufficient.
-    The occupancy baseline likewise requires an independently evidenced count
-    and complete sign-event history following its effective timestamp.
-
-    Event signals remain UNATTRIBUTED: proximity/UI-source alone cannot bind an
-    SOS/FHC to a crisis. Output never claims Red/Green, or AS under null policy.
-    """
-    crisis_id = crisis.get("crisis_id")
-    if not isinstance(crisis_id, str) or not crisis_id.strip():
-        raise ValueError("R2B crisis_id is missing")
-    if not isinstance(site_id, str) or not site_id.strip():
-        raise ValueError("R2B site_id is missing")
-    snapshot = ncm_r2b_iso(as_of, "as_of")
-    active_from = ncm_r2b_iso(crisis.get("created_at"), "crisis.created_at")
-    cleared = crisis.get("cleared_at")
-    if crisis.get("status") == "cleared" and not cleared:
-        raise ValueError("R2B cleared crisis requires cleared_at")
-    cleared_at = (ncm_r2b_iso(cleared, "crisis.cleared_at")
-                  if cleared is not None else None)
-    active_to = min(snapshot, cleared_at) if cleared_at is not None else snapshot
-    if active_to < active_from:
-        raise ValueError("R2B crisis clear/as_of precedes creation")
-    reasons: set[str] = set()
-    revision_zero = crisis.get("event_revision") in (None, 0)
-    scoped_revisions: List[Dict[str, Any]] = []
-    seen_revisions: set[int] = set()
-    if revision_zero:
-        reasons.add("legacy_or_missing_crisis_revision")
-    else:
-        for record in revisions:
-            if record.get("crisis_id") != crisis_id:
-                raise ValueError("R2B foreign crisis revision")
-            number = record.get("revision")
-            if isinstance(number, bool) or not isinstance(number, int) or number < 1 or number in seen_revisions:
-                raise ValueError("R2B invalid or duplicate crisis revision")
-            seen_revisions.add(number)
-            start = ncm_r2b_iso(record.get("effective_from"), "revision.effective_from")
-            until = (ncm_r2b_iso(record["effective_until"], "revision.effective_until")
-                     if record.get("effective_until") is not None else active_to)
-            if until < start:
-                raise ValueError("R2B reversed crisis revision")
-            geometry = ncm_r2b_json_object(record.get("geometry_json"), "geometry_json")
-            policy = ncm_r2b_json_object(record.get("policy_json"), "policy_json")
-            for name, bounds in (("center_latitude", (-90, 90)),
-                                 ("center_longitude", (-180, 180)),
-                                 ("radius_km", (0, 20040))):
-                geometry[name] = ncm_r2b_number(geometry.get(name), name, *bounds)
-            if geometry["radius_km"] <= 0:
-                raise ValueError("R2B radius must be positive")
-            required = policy.get("response_required")
-            if required is not None and not isinstance(required, bool):
-                raise ValueError("R2B response_required must be boolean or null")
-            scoped_revisions.append({"revision": number, "start": start,
-                                     "end": min(until, active_to),
-                                     "geometry": geometry, "response_required": required})
-        scoped_revisions.sort(key=lambda r: (r["start"], r["revision"]))
-        for first, second in zip(scoped_revisions, scoped_revisions[1:]):
-            if first["end"] > second["start"]:
-                raise ValueError("R2B overlapping crisis revision windows")
-        if not scoped_revisions:
-            reasons.add("crisis_revision_not_captured")
-
-    # Valid windows are externally corroborated; a mutable Site coordinate has
-    # no effective_from/effective_until proof and must never enter this list.
-    site_windows: List[Dict[str, Any]] = []
-    for loc in location_windows:
-        if loc.get("evidence_kind") != "verified_window":
-            reasons.add("point_location_not_time_bounded")
-            continue
-        if not loc.get("observation_id") or not loc.get("evidence_basis"):
-            raise ValueError("R2B verified location window lacks provenance")
-        start = ncm_r2b_iso(loc.get("effective_from"), "location.effective_from")
-        until = ncm_r2b_iso(loc.get("effective_until"), "location.effective_until")
-        if until <= start:
-            raise ValueError("R2B location window is reversed or empty")
-        lat = ncm_r2b_number(loc.get("latitude"), "site latitude", -90, 90)
-        lon = ncm_r2b_number(loc.get("longitude"), "site longitude", -180, 180)
-        site_windows.append({"start": start, "end": until, "latitude": lat,
-                             "longitude": lon, "id": str(loc["observation_id"]),
-                             "basis": str(loc["evidence_basis"])})
-    site_windows.sort(key=lambda item: (item["start"], item["end"]))
-    if any(a["end"] > b["start"] for a, b in zip(site_windows, site_windows[1:])):
-        raise ValueError("R2B overlapping verified location windows")
-    if not site_windows:
-        reasons.add("site_location_window_unavailable")
-
-    ordered_events: List[tuple[datetime, int, datetime, Dict[str, Any]]] = []
-    ids: set[int] = set()
-    for event in events:
-        eid = event.get("id")
-        if isinstance(eid, bool) or not isinstance(eid, int) or eid <= 0 or eid in ids:
-            raise ValueError("R2B invalid or duplicate raw event ID")
-        if event.get("site_id") != site_id:
-            raise ValueError("R2B raw event has foreign Site identity")
-        ids.add(eid)
-        occurred = ncm_r2b_iso(event.get("occurred_at"), "event.occurred_at")
-        received = ncm_r2b_iso(event.get("created_at"), "event.created_at")
-        # Fixed evidence snapshot excludes events recorded after as_of.
-        if received <= snapshot and occurred <= snapshot:
-            ordered_events.append((occurred, eid, received, event))
-    ordered_events.sort(key=lambda row: (row[0], row[1]))
-
-    baseline_at: Optional[datetime] = None
-    baseline_count = 0
-    if occupancy_baseline is not None:
-        baseline_at = ncm_r2b_iso(occupancy_baseline.get("at"), "occupancy.at")
-        baseline_count = occupancy_baseline.get("active_count")
-        if (isinstance(baseline_count, bool) or not isinstance(baseline_count, int)
-                or baseline_count < 0 or not occupancy_baseline.get("evidence_ref")):
-            raise ValueError("R2B occupancy baseline requires witnessed count and reference")
-    if baseline_at is None:
-        reasons.add("occupancy_baseline_unavailable")
-    if not sign_history_complete:
-        reasons.add("sign_history_incomplete")
-
-    limits = {active_from, active_to}
-    for r in scoped_revisions:
-        if active_from < r["start"] < active_to:
-            limits.add(r["start"])
-        if active_from < r["end"] < active_to:
-            limits.add(r["end"])
-    for loc in site_windows:
-        for at in (loc["start"], loc["end"]):
-            if active_from < at < active_to:
-                limits.add(at)
-    if baseline_at is not None and active_from < baseline_at < active_to:
-        limits.add(baseline_at)
-    for at, _eid, _receipt, ev in ordered_events:
-        if ev.get("event_type") in {"signin", "signout"} and active_from < at < active_to:
-            limits.add(at)
-    points = sorted(limits)
-    memberships: List[Dict[str, Any]] = []
-    exposures: List[Dict[str, Any]] = []
-    unknown_exposures: List[Dict[str, Any]] = []
-    possible_as: List[Dict[str, Any]] = []
-    policy_values: set[str] = set()
-    for start, end in zip(points, points[1:]):
-        if start >= end:
-            continue
-        revision = next((r for r in scoped_revisions if r["start"] <= start < r["end"]), None)
-        loc = next((p for p in site_windows if p["start"] <= start < p["end"]), None)
-        if revision is None or loc is None:
-            member = "unknown"
-            reasons.add("crisis_revision_gap" if revision is None else "site_location_gap")
-        else:
-            geometry = revision["geometry"]
-            member = ("in_area" if haversine_km(loc["latitude"], loc["longitude"],
-                                                geometry["center_latitude"], geometry["center_longitude"])
-                      <= geometry["radius_km"] else "outside")
-        duration = (end - start).total_seconds()
-        general = {"started_at": start.isoformat(), "ended_at": end.isoformat(),
-                   "duration_seconds": duration}
-        memberships.append({**general, "membership_state": member,
-                            "scope_revision": revision["revision"] if revision else None,
-                            "location_observation_id": loc["id"] if loc else None,
-                            "evidence_basis": loc["basis"] if loc and revision else None})
-        if revision is not None:
-            required = revision["response_required"]
-            policy_values.add("unknown" if required is None else "required" if required else "not_required")
-            if required is None:
-                reasons.add("response_policy_unknown")
-        count: Optional[int] = None
-        if sign_history_complete and baseline_at is not None and baseline_at <= start:
-            count = baseline_count
-            for at, _eid, _received, event in ordered_events:
-                if at < baseline_at or at > start or (at == baseline_at and at <= start):
-                    # Baseline count already includes events at its own timestamp.
-                    continue
-                if event.get("event_type") == "signin":
-                    count += 1
-                elif event.get("event_type") == "signout":
-                    count = max(0, count - 1)  # identical to global Site replay
-        if member == "in_area":
-            if count is None:
-                unknown_exposures.append({**general, "reason": "occupancy_unproven"})
-                reasons.add("occupancy_unproven_during_membership")
-            elif count > 0:
-                exposures.append({**general, "exposure_state": "occupied_in_area",
-                                  "scope_revision": revision["revision"],
-                                  "location_observation_id": loc["id"],
-                                  "evidence_basis": "verified_location_and_replayed_sign_count"})
-                # This is a potential policy-dependent response window only;
-                # no response binding, alert delivery, or AS claim is made.
-                if revision["response_required"] is True:
-                    possible_as.append({**general, "state": "possible_awaiting_not_attributed",
-                                        "scope_revision": revision["revision"]})
-        elif member == "unknown":
-            unknown_exposures.append({**general, "reason": "membership_unproven"})
-
-    signal_refs: List[Dict[str, Any]] = []
-    for at, eid, received, event in ordered_events:
-        if event.get("event_type") not in {"sos", "full_headcount"}:
-            continue
-        if not active_from <= at < active_to:
-            continue
-        membership_at_signal = next(
-            (part["membership_state"] for part in memberships
-             if ncm_r2b_iso(part["started_at"], "interval.started_at") <= at
-             < ncm_r2b_iso(part["ended_at"], "interval.ended_at")), "unknown")
-        if membership_at_signal == "outside":
-            # Outside-radius SOS remains in the ORIGINAL global emergency feed.
-            # It is not even a geographic crisis candidate here.
-            continue
-        payload = ncm_r2b_json_object(event.get("payload_json") or {}, "event.payload_json")
-        signal_refs.append({"raw_event_id": eid, "event_type": event["event_type"],
-                            "occurred_at": at.isoformat(), "received_at": received.isoformat(),
-                            "source_claim": payload.get("source") if isinstance(payload.get("source"), str) else None,
-                            "membership_evidence": membership_at_signal,
-                            "crisis_attribution": "unproven"})
-    if signal_refs:
-        reasons.add("crisis_signal_attribution_unavailable")
-
-    watermarks = [received for _at, _eid, received, _ev in ordered_events]
-    membership_status = ("unknown" if not memberships or all(s["membership_state"] == "unknown" for s in memberships)
-                         else "partial" if any(s["membership_state"] == "unknown" for s in memberships) else "complete")
-    return {
-        "schema_version": NCM_R2B_PROJECTOR_VERSION,
-        "crisis_id": crisis_id, "crisis_revision": crisis.get("event_revision"),
-        "site_id": site_id, "as_of": snapshot.isoformat(),
-        "event_started_at": active_from.isoformat(),
-        "event_ended_at": (cleared_at.isoformat() if cleared_at is not None
-                           and cleared_at <= snapshot else None),
-        "projection_basis": "pure_time_bounded_source_evidence_no_mutation",
-        "membership_intervals": ncm_r2b_segments(memberships),
-        "exposure_intervals": ncm_r2b_segments(exposures),
-        "unproven_exposure_intervals": ncm_r2b_segments(unknown_exposures),
-        "response_intervals": [],  # No crisis_id-bound SOS/FHC evidence exists in R2A.
-        "possible_awaiting_intervals": ncm_r2b_segments(possible_as),
-        "possible_unattributed_signal_refs": signal_refs,
-        "evidence_event_ids": [eid for _at, eid, _created, _ev in ordered_events],
-        "membership_evidence_status": membership_status,
-        "evidence_status": "partial" if reasons else "complete",
-        "unknown_reasons": sorted(reasons),
-        "response_policy_states": sorted(policy_values),
-        "source_watermark": max(watermarks).isoformat() if watermarks else None,
-    }
 
 # =========================================================
 # Database Init
@@ -14042,3 +13638,196 @@ async def api_full_headcount(
             "site_id": site_id,
             **state,
         }
+
+
+# =========================================================
+# NZ-NCM - lean internal evidence transport, v1
+# Reuses existing data ONLY; no new tables or operational engine.
+# SERVER-TO-SERVER: NEVER put the key into Vite/browser JavaScript.
+# Disabled when SIGNLOG_NCM_INTERNAL_KEY is not configured.
+# Existing publicly reachable Admin routes still require a
+# separate whole-system authentication review before agency use.
+# =========================================================
+
+NCM_INTERNAL_CONTRACT_VERSION = "ncm-internal-evidence.v1"
+
+
+def ncm_require_internal_key(
+    x_ncm_internal_key: Optional[str] = Header(default=None, alias="X-NCM-Internal-Key"),
+) -> None:
+    key = os.getenv("SIGNLOG_NCM_INTERNAL_KEY", "")
+    if not key or len(key) < 32:
+        raise HTTPException(status_code=503, detail="NZ-NCM internal evidence service not configured")
+    if not x_ncm_internal_key or not secrets.compare_digest(key, x_ncm_internal_key):
+        raise HTTPException(status_code=403, detail="NZ-NCM internal evidence access denied")
+
+
+class NcmArchiveRequest(BaseModel):
+    reason: str = Field(min_length=3, max_length=500)
+    actor_ref: str = Field(min_length=1, max_length=120)
+
+
+@app.get("/ncm/internal/crises", dependencies=[Depends(ncm_require_internal_key)])
+async def ncm_internal_crises(
+    status: Literal["all", "active", "cleared", "archived"] = "all",
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0, le=100000),
+    as_of: Optional[str] = None,
+):
+    """Bounded crisis index including cleared/archived rows; not a public feed."""
+    snapshot = parse_query_iso(as_of, "as_of") if as_of else utc_now_iso()
+    clause = ""
+    params: Dict[str, Any] = {"snapshot": snapshot, "limit": limit + 1, "offset": offset}
+    if status == "active":
+        clause = " AND status = 'active'"
+    elif status == "cleared":
+        clause = " AND status = 'cleared' AND archived_at IS NULL"
+    elif status == "archived":
+        clause = " AND archived_at IS NOT NULL"
+    with get_db() as conn:
+        rows = fetch_all(conn, """
+            SELECT crisis_id, source, crisis_class, hazard_type, name, status,
+                   center_latitude, center_longitude, radius_km,
+                   created_at, updated_at, cleared_at, archived_at,
+                   event_revision, response_required, event_category, intensity
+            FROM crises WHERE created_at <= :snapshot
+        """ + clause + " ORDER BY created_at DESC, crisis_id DESC LIMIT :limit OFFSET :offset", params)
+    return {"contract": NCM_INTERNAL_CONTRACT_VERSION, "as_of": snapshot,
+            "items": rows[:limit], "has_more": len(rows) > limit,
+            "next_offset": offset + limit if len(rows) > limit else None,
+            "history_basis": "recorded_crisis_rows; geometry NOT historical-site proof"}
+
+
+@app.get("/ncm/internal/sites", dependencies=[Depends(ncm_require_internal_key)])
+async def ncm_internal_sites(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0, le=100000),
+    as_of: Optional[str] = None,
+):
+    """Minimal Site directory, including archived Sites for case retrieval."""
+    snapshot = parse_query_iso(as_of, "as_of") if as_of else utc_now_iso()
+    with get_db() as conn:
+        rows = fetch_all(conn, """
+            SELECT site_id, name, company_name, city, latitude, longitude,
+                   operational_state, created_at, updated_at
+            FROM sites WHERE created_at <= :snapshot
+            ORDER BY site_id ASC LIMIT :limit OFFSET :offset
+        """, {"snapshot": snapshot, "limit": limit + 1, "offset": offset})
+    return {"contract": NCM_INTERNAL_CONTRACT_VERSION, "as_of": snapshot,
+            "items": rows[:limit], "has_more": len(rows) > limit,
+            "next_offset": offset + limit if len(rows) > limit else None,
+            "location_basis": "CURRENT_STORED_COORDINATES_ONLY; NOT HISTORICAL_LOCATION_EVIDENCE"}
+
+
+@app.get("/ncm/internal/sites/{site_id}/signals", dependencies=[Depends(ncm_require_internal_key)])
+async def ncm_internal_site_signals(
+    site_id: str,
+    limit: int = Query(default=100, ge=1, le=200),
+    before_id: Optional[int] = Query(default=None, ge=1),
+    as_of: Optional[str] = None,
+):
+    """Source-event IDs and timestamps, without names or raw worker payloads.
+
+    Keyset pages run by ingestion ID. Clients replay events by
+    (occurred_at, id) only after retrieving complete source pages.
+    """
+    snapshot = parse_query_iso(as_of, "as_of") if as_of else utc_now_iso()
+    args: Dict[str, Any] = {"site_id": site_id, "snapshot": snapshot, "limit": limit + 1}
+    cursor = ""
+    if before_id is not None:
+        cursor = " AND id < :before_id"
+        args["before_id"] = before_id
+    with get_db() as conn:
+        site = fetch_one(conn, "SELECT site_id FROM sites WHERE site_id=:site_id", {"site_id": site_id})
+        if site is None:
+            raise HTTPException(status_code=404, detail="Site not found")
+        rows = fetch_all(conn, """
+            SELECT id, site_id, event_type, occurred_at, created_at, payload_json
+            FROM events
+            WHERE site_id=:site_id AND created_at <= :snapshot
+              AND event_type IN ('signin','signout','sos','full_headcount')
+        """ + cursor + " ORDER BY id DESC LIMIT :limit", args)
+    page = rows[:limit]
+    result = []
+    for row in page:
+        payload = json_loads(row.get("payload_json"))
+        result.append({"event_id": row["id"], "site_id": row["site_id"],
+                       "event_type": row["event_type"], "occurred_at": row["occurred_at"],
+                       "received_at": row["created_at"],
+                       "source_claim": payload.get("source") if isinstance(payload.get("source"), str) else None,
+                       "source_evidence": payload.get("source_evidence", "legacy_unknown")})
+    return {"contract": NCM_INTERNAL_CONTRACT_VERSION, "as_of": snapshot,
+            "site_id": site_id, "items": result, "has_more": len(rows) > limit,
+            "next_before_id": page[-1]["id"] if len(rows) > limit else None,
+            "ordering": "ingestion_id_desc; replay_by_occurred_at_event_id_after_full_retrieval",
+            "complete_history": not (len(rows) > limit or before_id is not None),
+            "record_basis": "original_signlog_event_ids_no_raw_person_payload"}
+
+
+@app.get("/ncm/internal/crises/{crisis_id}", dependencies=[Depends(ncm_require_internal_key)])
+async def ncm_internal_crisis_detail(crisis_id: str):
+    """Captured revisions/actions, including legacy revision-zero gaps."""
+    with get_db() as conn:
+        crisis = fetch_one(conn, "SELECT * FROM crises WHERE crisis_id=:id", {"id": crisis_id})
+        if crisis is None:
+            raise HTTPException(status_code=404, detail="Crisis not found")
+        revisions = fetch_all(conn, """
+            SELECT revision_id, crisis_id, revision, geometry_json,
+                   classification_json, source_json, policy_json, effective_from,
+                   effective_until, snapshot_json, actor_type, actor_ref, recorded_at
+            FROM crisis_event_revisions WHERE crisis_id=:id
+            ORDER BY revision ASC LIMIT 201
+        """, {"id": crisis_id})
+        actions = fetch_all(conn, """
+            SELECT action_id, action_type, actor_type, actor_ref, reason,
+                   before_revision, after_revision, recorded_at
+            FROM crisis_audit_actions WHERE crisis_id=:id
+            ORDER BY recorded_at DESC, action_id DESC LIMIT 201
+        """, {"id": crisis_id})
+    if len(revisions) > 200 or len(actions) > 200:
+        raise HTTPException(status_code=409, detail="Evidence exceeds bounded read; no truncated history returned")
+    return {"contract": NCM_INTERNAL_CONTRACT_VERSION, "crisis": crisis,
+            "revisions": revisions, "audit_actions": actions,
+            "revision_complete": crisis.get("event_revision") == len(revisions),
+            "response_attribution": "NOT_PROVEN_BY_GEOGRAPHIC_PROXIMITY"}
+
+
+@app.post("/ncm/internal/crises/{crisis_id}/archive", dependencies=[Depends(ncm_require_internal_key)])
+async def ncm_internal_archive_crisis(crisis_id: str, payload: NcmArchiveRequest):
+    """Archive an already-cleared crisis, preserving all raw/interval records.
+
+    Actor identity is supplied by the trusted server gateway. It is
+    not an operator authentication substitute at the Backend itself.
+    """
+    now = utc_now_iso()
+    with get_db() as conn:
+        crisis = fetch_one(conn, """
+            SELECT status, archived_at, event_revision FROM crises WHERE crisis_id=:id
+        """, {"id": crisis_id})
+        if crisis is None:
+            raise HTTPException(status_code=404, detail="Crisis not found")
+        if crisis["status"] != "cleared":
+            raise HTTPException(status_code=409, detail="Only a cleared crisis may be archived")
+        if crisis["archived_at"] is not None:
+            return {"status": "already_archived", "crisis_id": crisis_id, "archived_at": crisis["archived_at"]}
+        result = execute_write(conn, """
+            UPDATE crises SET archived_at=:now, updated_at=:now
+            WHERE crisis_id=:id AND status='cleared' AND archived_at IS NULL
+        """, {"now": now, "id": crisis_id})
+        if result.rowcount != 1:
+            raise HTTPException(status_code=409, detail="Crisis archive state changed; refresh and retry")
+        execute_write(conn, """
+            INSERT INTO crisis_audit_actions (
+                action_id, crisis_id, action_type, actor_type, actor_ref,
+                reason, before_revision, after_revision, request_id,
+                action_payload_json, recorded_at
+            ) VALUES (
+                :action_id, :crisis_id, 'archive', 'internal_gateway', :actor_ref,
+                :reason, :revision, :revision, NULL, :payload, :now
+            )
+        """, {"action_id": str(uuid4()), "crisis_id": crisis_id,
+              "actor_ref": payload.actor_ref.strip(), "reason": payload.reason.strip(),
+              "revision": crisis["event_revision"],
+              "payload": json.dumps({"basis": "archived_after_crisis_clearance", "raw_events_deleted": False}),
+              "now": now})
+    return {"status": "archived", "crisis_id": crisis_id, "archived_at": now}
