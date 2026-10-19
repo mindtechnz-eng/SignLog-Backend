@@ -22,6 +22,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Connection, Engine, Result
 
+# CRR-01A: separate evidence-context capture, never an emergency signal authority.
+from ncm_crr01a_attention import (
+    ensure_crr01a_schema, capture_crisis_activation_observations,
+)
+
+NCM_CRR01A_CAPTURE_ENABLED = os.getenv("NCM_CRR01A_CAPTURE", "false").strip().lower() in {"1", "true", "yes"}
+
 # =========================================================
 # SignLog Backend v1.8
 # Shared Authority Layer for:
@@ -34,6 +41,9 @@ from sqlalchemy.engine import Connection, Engine, Result
 # =========================================================
 
 load_dotenv()
+
+# CRR-01A disabled by default; read flag after .env is loaded.
+NCM_CRR01A_CAPTURE_ENABLED = os.getenv('NCM_CRR01A_CAPTURE', 'false').strip().lower() in {'1', 'true', 'yes'}
 
 APP_NAME = "signlog-backend"
 DB_PATH = os.getenv("SIGNLOG_DB_PATH", "signlog.db")
@@ -1372,6 +1382,9 @@ def init_db() -> None:
         # clearance, live-state routes and field-event writes are
         # intentionally untouched in this cut.
         ensure_ncm_event_schema(conn)
+        # Activation-time context only; optional during R0 / rollout.
+        if NCM_CRR01A_CAPTURE_ENABLED:
+            ensure_crr01a_schema(conn)
 
 
 @app.on_event("startup")
@@ -12990,9 +13003,42 @@ async def admin_create_crisis(
         # No Site response or historic membership is inferred here.
         ncm_record_crisis_creation_evidence(conn, crisis_id, payload, now)
 
+        # CRR-01A: durable *context only* Site observation at activation.
+        # No historical Orange, delivery receipt, response obligation or SOS/FHC
+        # is inferred. Capture failure is isolated behind a savepoint so the
+        # original crisis creation remains operational. Kiosk/SOS/FHC unchanged.
+        capture_result = None
+        if NCM_CRR01A_CAPTURE_ENABLED:
+            try:
+                with conn.begin_nested():
+                    captured = capture_crisis_activation_observations(
+                        conn,
+                        crisis_id=crisis_id,
+                        revision=1,
+                        center_latitude=payload.center_latitude,
+                        center_longitude=payload.center_longitude,
+                        radius_km=payload.radius_km,
+                        observed_at=utc_now_iso(),
+                    )
+                capture_result = {
+                    "state": "context_only",
+                    "inventory_scanned": captured.inventory_scanned,
+                    "geographic_candidates": captured.inside_candidates,
+                    "location_unknown": captured.location_unknown,
+                    "attributed_site_responses": None,
+                }
+            except Exception:
+                # Do not transform an optional audit observation into a
+                # barrier to originating an emergency crisis. No false success.
+                capture_result = {
+                    "state": "capture_unavailable",
+                    "attributed_site_responses": None,
+                }
+
         return {
             "status": "ok",
             "crisis_id": crisis_id,
+            **({"crr01a_capture": capture_result} if NCM_CRR01A_CAPTURE_ENABLED else {}),
         }
 
 
@@ -13852,5 +13898,4 @@ async def ncm_internal_archive_crisis(crisis_id: str, payload: NcmArchiveRequest
               "payload": json.dumps({"basis": "archived_after_crisis_clearance", "raw_events_deleted": False}),
               "now": now})
     return {"status": "archived", "crisis_id": crisis_id, "archived_at": now}
-
 
