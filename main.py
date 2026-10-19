@@ -27,6 +27,9 @@ from ncm_crr01a_attention import (
     ensure_crr01a_schema, capture_crisis_activation_observations,
 )
 
+# C2-A: Backend-owned crisis/Site issued context; no Kiosk receipt inferred.
+from ncm_crr01a_contexts import ensure_crr01a_context_schema, issue_candidate_contexts, CONTRACT as NCM_CONTEXT_CONTRACT
+
 NCM_CRR01A_CAPTURE_ENABLED = os.getenv("NCM_CRR01A_CAPTURE", "false").strip().lower() in {"1", "true", "yes"}
 
 # =========================================================
@@ -44,6 +47,8 @@ load_dotenv()
 
 # CRR-01A disabled by default; read flag after .env is loaded.
 NCM_CRR01A_CAPTURE_ENABLED = os.getenv('NCM_CRR01A_CAPTURE', 'false').strip().lower() in {'1', 'true', 'yes'}
+# C2-A independent feature flag: disabled until staging evidence is proven.
+NCM_CRR01A_CONTEXT_ENABLED = os.getenv('NCM_CRR01A_CONTEXT_ISSUANCE', 'false').strip().lower() in {'1', 'true', 'yes'}
 
 APP_NAME = "signlog-backend"
 DB_PATH = os.getenv("SIGNLOG_DB_PATH", "signlog.db")
@@ -1385,6 +1390,8 @@ def init_db() -> None:
         # Activation-time context only; optional during R0 / rollout.
         if NCM_CRR01A_CAPTURE_ENABLED:
             ensure_crr01a_schema(conn)
+        if NCM_CRR01A_CONTEXT_ENABLED:
+            ensure_crr01a_context_schema(conn)
 
 
 @app.on_event("startup")
@@ -13732,6 +13739,39 @@ def ncm_require_internal_key(
 class NcmArchiveRequest(BaseModel):
     reason: str = Field(min_length=3, max_length=500)
     actor_ref: str = Field(min_length=1, max_length=120)
+
+
+# CRR-01A C2-A: named-crisis Site context *issuance*, not Kiosk delivery.
+# This is protected server-to-server and never wired to the public bootstrap.
+# Authentication of the physical Kiosk and renderer receipts belong to C2-B.
+@app.post("/ncm/internal/kiosks/{kiosk_id}/crisis-contexts/issue",
+          dependencies=[Depends(ncm_require_internal_key)])
+async def ncm_internal_issue_crisis_contexts(kiosk_id: str):
+    if not NCM_CRR01A_CONTEXT_ENABLED:
+        raise HTTPException(status_code=503, detail="CRR-01A context issuance not enabled")
+    with get_db() as conn:
+        try:
+            issued = issue_candidate_contexts(conn, kiosk_id=kiosk_id, issued_at=utc_now_iso())
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except RuntimeError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+    return {
+        "contract": NCM_CONTEXT_CONTRACT,
+        "kiosk_id": issued.kiosk_id,
+        "site_id": issued.site_id,
+        "issued_at": issued.issued_at,
+        "items": issued.contexts,
+        "source_counts": {
+            "examined_crises": issued.examined_crises,
+            "in_area_candidates": issued.in_area_candidates,
+            "outside_current_radius": issued.out_of_area,
+            "unknown_geometry": issued.unknown_geometry,
+        },
+        "evidence_notice": "Backend issued candidate only; no Kiosk receipt, display, human read or attributed SOS/FHC",
+    }
 
 
 @app.get("/ncm/internal/crises", dependencies=[Depends(ncm_require_internal_key)])
