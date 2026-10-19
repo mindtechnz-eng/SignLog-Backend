@@ -29,6 +29,11 @@ from ncm_crr01a_attention import (
 
 # C2-A: Backend-owned crisis/Site issued context; no Kiosk receipt inferred.
 from ncm_crr01a_contexts import ensure_crr01a_context_schema, issue_candidate_contexts, CONTRACT as NCM_CONTEXT_CONTRACT
+# CRR-01A C2-B1: distinct appliance credentials and renderer claims.
+from ncm_crr01a_device_receipts import (
+    CONTRACT as NCM_RENDERER_CONTRACT, ensure_crr01a_device_receipt_schema,
+    provision_credential, revoke_credential, authenticate_device, accept_renderer_claim,
+)
 
 NCM_CRR01A_CAPTURE_ENABLED = os.getenv("NCM_CRR01A_CAPTURE", "false").strip().lower() in {"1", "true", "yes"}
 
@@ -49,6 +54,8 @@ load_dotenv()
 NCM_CRR01A_CAPTURE_ENABLED = os.getenv('NCM_CRR01A_CAPTURE', 'false').strip().lower() in {'1', 'true', 'yes'}
 # C2-A independent feature flag: disabled until staging evidence is proven.
 NCM_CRR01A_CONTEXT_ENABLED = os.getenv('NCM_CRR01A_CONTEXT_ISSUANCE', 'false').strip().lower() in {'1', 'true', 'yes'}
+# Credential provisioning/receipt routes remain disabled until tested in staging.
+NCM_CRR01A_RENDERER_ENABLED = os.getenv('NCM_CRR01A_RENDERER_RECEIPTS', 'false').strip().lower() in {'1', 'true', 'yes'}
 
 APP_NAME = "signlog-backend"
 DB_PATH = os.getenv("SIGNLOG_DB_PATH", "signlog.db")
@@ -1392,6 +1399,8 @@ def init_db() -> None:
             ensure_crr01a_schema(conn)
         if NCM_CRR01A_CONTEXT_ENABLED:
             ensure_crr01a_context_schema(conn)
+        if NCM_CRR01A_CONTEXT_ENABLED and NCM_CRR01A_RENDERER_ENABLED:
+            ensure_crr01a_device_receipt_schema(conn)
 
 
 @app.on_event("startup")
@@ -13772,6 +13781,109 @@ async def ncm_internal_issue_crisis_contexts(kiosk_id: str):
         },
         "evidence_notice": "Backend issued candidate only; no Kiosk receipt, display, human read or attributed SOS/FHC",
     }
+
+
+# CRR-01A C2-B1 — Backend-owned device provisioning and authenticated claims.
+# Only the protected operator/backend route can provision or rotate a credential.
+# The appliance credential is NEVER returned to browser bootstrap or web scripts.
+class NcmDeviceProvisionRequest(BaseModel):
+    rotate: bool = False
+
+
+class NcmRendererDisplayRequest(BaseModel):
+    context_id: str = Field(min_length=8, max_length=128)
+    displayed_at: str = Field(min_length=10, max_length=64)
+    claim_id: str = Field(min_length=8, max_length=128)
+    renderer_version: str = Field(min_length=1, max_length=80)
+
+
+def ncm_require_renderer_device(authorization: Optional[str] = Header(default=None)):
+    if not NCM_CRR01A_RENDERER_ENABLED or not NCM_CRR01A_CONTEXT_ENABLED:
+        raise HTTPException(status_code=503, detail="CRR-01A renderer contract not enabled")
+    with get_db() as conn:
+        try:
+            return authenticate_device(conn, bearer=authorization)
+        except PermissionError:
+            raise HTTPException(status_code=403, detail="Appliance credential denied") from None
+
+
+@app.post("/ncm/internal/kiosks/{kiosk_id}/device-credential/provision",
+          dependencies=[Depends(ncm_require_internal_key)])
+async def ncm_internal_provision_device(kiosk_id: str, payload: NcmDeviceProvisionRequest):
+    if not NCM_CRR01A_RENDERER_ENABLED or not NCM_CRR01A_CONTEXT_ENABLED:
+        raise HTTPException(status_code=503, detail="CRR-01A renderer contract not enabled")
+    with get_db() as conn:
+        try:
+            result = provision_credential(conn, kiosk_id=kiosk_id,
+                                          now=utc_now_iso(), rotate=payload.rotate)
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except RuntimeError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+    # One-time secret: provisioning response only. Never log or cache it.
+    from fastapi.responses import JSONResponse
+    return JSONResponse(result, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+
+
+@app.post("/ncm/internal/kiosks/{kiosk_id}/device-credential/revoke",
+          dependencies=[Depends(ncm_require_internal_key)])
+async def ncm_internal_revoke_device(kiosk_id: str):
+    if not NCM_CRR01A_RENDERER_ENABLED or not NCM_CRR01A_CONTEXT_ENABLED:
+        raise HTTPException(status_code=503, detail="CRR-01A renderer contract not enabled")
+    with get_db() as conn:
+        try:
+            return revoke_credential(conn, kiosk_id=kiosk_id, now=utc_now_iso())
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@app.post("/ncm/kiosk/crisis-contexts/issue")
+async def ncm_device_issue_contexts(principal=Depends(ncm_require_renderer_device)):
+    if not NCM_CRR01A_CONTEXT_ENABLED:
+        raise HTTPException(status_code=503, detail="C2-A issuance not enabled")
+    with get_db() as conn:
+        try:
+            issued = issue_candidate_contexts(conn, kiosk_id=principal.kiosk_id,
+                                              issued_at=utc_now_iso())
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except RuntimeError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+    from fastapi.responses import JSONResponse
+    return JSONResponse({
+        "contract": NCM_CONTEXT_CONTRACT,
+        "kiosk_id": issued.kiosk_id,
+        "site_id": issued.site_id,
+        "issued_at": issued.issued_at,
+        "items": issued.contexts,
+        "evidence_notice": "Issued named-crisis candidates; no renderer receipt or human response asserted",
+    }, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/ncm/kiosk/crisis-contexts/display")
+async def ncm_device_report_display(payload: NcmRendererDisplayRequest,
+                                    principal=Depends(ncm_require_renderer_device)):
+    with get_db() as conn:
+        try:
+            evidence = accept_renderer_claim(conn, principal=principal,
+                context_id=payload.context_id, displayed_at=payload.displayed_at,
+                received_at=utc_now_iso(), claim_id=payload.claim_id,
+                renderer_version=payload.renderer_version)
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except PermissionError:
+            raise HTTPException(status_code=403, detail="Context is outside appliance scope") from None
+        except RuntimeError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+    evidence["contract"] = NCM_RENDERER_CONTRACT
+    evidence["notice"] = "Device-authenticated renderer claim, NOT pixel proof, human acknowledgement or SOS/FHC attribution"
+    return evidence
 
 
 @app.get("/ncm/internal/crises", dependencies=[Depends(ncm_require_internal_key)])
