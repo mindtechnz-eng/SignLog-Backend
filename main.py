@@ -24,7 +24,10 @@ from sqlalchemy.engine import Connection, Engine, Result
 
 # CRR-01A: separate evidence-context capture, never an emergency signal authority.
 from ncm_crr01a_attention import (
-    ensure_crr01a_schema, capture_crisis_activation_observations,
+    ensure_crr01a_schema, capture_crisis_activation_observations, read_activation_observations,
+)
+from ncm_crisis_signal_journal import (
+    ensure_signal_journal_schema, record_crisis_site_state, read_crisis_signal_journal,
 )
 
 # C2-A: Backend-owned crisis/Site issued context; no Kiosk receipt inferred.
@@ -1394,6 +1397,7 @@ def init_db() -> None:
         # clearance, live-state routes and field-event writes are
         # intentionally untouched in this cut.
         ensure_ncm_event_schema(conn)
+        ensure_signal_journal_schema(conn)
         # Activation-time context only; optional during R0 / rollout.
         if NCM_CRR01A_CAPTURE_ENABLED:
             ensure_crr01a_schema(conn)
@@ -2192,6 +2196,23 @@ def recompute_site_state(
             "site_id": site_id,
         },
     )
+
+    # CW-LOG-01B2: original Site event ingestion is the correct source clock,
+    # never an NCM browser poll. Write the crisis-scoped interpretation in
+    # this SAME DB transaction as site_status; no second evidence store.
+    original = fetch_one(conn, """SELECT id, event_type, occurred_at
+        FROM events WHERE site_id=:site_id ORDER BY id DESC LIMIT 1""", {"site_id": site_id})
+    site_row = fetch_one(conn, """SELECT s.site_id,s.latitude,s.longitude,s.kiosk_id,
+        ss.active_count,ss.sos_active,ss.full_headcount_confirmed,ss.last_full_headcount_at
+        FROM sites s LEFT JOIN site_status ss ON ss.site_id=s.site_id
+        WHERE s.site_id=:site_id""", {"site_id": site_id})
+    if site_row and original:
+        for target in list_active_crises(conn):
+            inside, pending = ncm_current_crisis_attention(site_row, [target])
+            record_crisis_site_state(conn, crisis=target, site=site_row,
+                site_in_radius=inside, qualified_pending=pending, observed_at=utc_now_iso(),
+                source_event_id=int(original["id"]), source_event_type=original["event_type"],
+                source_occurred_at=original["occurred_at"])
 
     return {
         "status": status,
@@ -13019,6 +13040,18 @@ async def admin_create_crisis(
         # No Site response or historic membership is inferred here.
         ncm_record_crisis_creation_evidence(conn, crisis_id, payload, now)
 
+        # CW-LOG-01B2: creation immediately creates the NZ-NCM AS signal for
+        # each already-live qualifying Site; original crisis ID and clock.
+        new_crisis = fetch_one(conn, "SELECT * FROM crises WHERE crisis_id=:id", {"id":crisis_id})
+        live_sites = fetch_all(conn, """SELECT s.site_id,s.latitude,s.longitude,s.kiosk_id,
+            ss.active_count,ss.sos_active,ss.full_headcount_confirmed,ss.last_full_headcount_at
+            FROM sites s LEFT JOIN site_status ss ON ss.site_id=s.site_id
+            WHERE s.operational_state='active' ORDER BY s.site_id""")
+        for current_site in live_sites:
+            inside, pending = ncm_current_crisis_attention(current_site, [new_crisis])
+            record_crisis_site_state(conn, crisis=new_crisis, site=current_site,
+                site_in_radius=inside, qualified_pending=pending, observed_at=now)
+
         # CRR-01A: durable *context only* Site observation at activation.
         # No historical Orange, delivery receipt, response obligation or SOS/FHC
         # is inferred. Capture failure is isolated behind a savepoint so the
@@ -14003,12 +14036,24 @@ async def ncm_internal_crisis_detail(crisis_id: str):
             FROM crisis_audit_actions WHERE crisis_id=:id
             ORDER BY recorded_at DESC, action_id DESC LIMIT 201
         """, {"id": crisis_id})
+        try:
+            activation = read_activation_observations(conn, crisis_id)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail='Bounded activation history exceeded') from exc
+        try:
+            signal_journal = read_crisis_signal_journal(conn, crisis_id)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail='Bounded crisis signal journal exceeded') from exc
+        source_observed_at = utc_now_iso()
     if len(revisions) > 200 or len(actions) > 200:
         raise HTTPException(status_code=409, detail="Evidence exceeds bounded read; no truncated history returned")
     return {"contract": NCM_INTERNAL_CONTRACT_VERSION, "crisis": crisis,
             "revisions": revisions, "audit_actions": actions,
             "revision_complete": crisis.get("event_revision") == len(revisions),
-            "response_attribution": "NOT_PROVEN_BY_GEOGRAPHIC_PROXIMITY"}
+            "response_attribution": "NOT_PROVEN_BY_GEOGRAPHIC_PROXIMITY",
+            "source_observed_at": source_observed_at,
+            "activation_evidence": activation,
+            "site_signal_journal": signal_journal}
 
 
 @app.post("/ncm/internal/crises/{crisis_id}/archive", dependencies=[Depends(ncm_require_internal_key)])

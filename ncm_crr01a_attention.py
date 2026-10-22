@@ -234,3 +234,42 @@ def capture_crisis_activation_observations(
         location_unknown=unknown, observation_clock=clock,
         capture_status="complete_inventory_snapshot",
     )
+
+
+def read_activation_observations(conn: Connection, crisis_id: str, *, max_rows: int = 5000) -> dict:
+    '''Bounded, READ-ONLY original activation observations for one crisis.
+
+    Missing optional schema or an unrecorded capture is not an empty, complete
+    response history. No current Site state is reinterpreted or backfilled.
+    '''
+    from sqlalchemy import inspect
+    if not isinstance(crisis_id, str) or not crisis_id.strip():
+        raise ValueError('Original crisis ID required')
+    if not isinstance(max_rows, int) or not 1 <= max_rows <= 5000:
+        raise ValueError('Invalid observation bound')
+    tables = set(inspect(conn).get_table_names())
+    required = {'ncm_crisis_site_capture_runs', 'ncm_crisis_site_activation_observations'}
+    if not required.issubset(tables):
+        return {'capture_status': 'schema_not_installed', 'capture_runs': [], 'observations': [],
+                'complete': False}
+    runs = conn.execute(text('''SELECT crisis_id, scope_revision, observation_clock,
+        inventory_scanned, inside_candidates, outside_observed, location_unknown,
+        source_basis, capture_status, contract_version
+        FROM ncm_crisis_site_capture_runs WHERE crisis_id=:id
+        ORDER BY scope_revision ASC LIMIT :limit'''),
+        {'id': crisis_id, 'limit': max_rows + 1}).mappings().all()
+    observations = conn.execute(text('''SELECT observation_id, crisis_id, site_id,
+        scope_revision, observation_clock, source_basis, event_specific_association,
+        evidence_status, contract_version
+        FROM ncm_crisis_site_activation_observations WHERE crisis_id=:id
+        ORDER BY observation_clock ASC, observation_id ASC LIMIT :limit'''),
+        {'id': crisis_id, 'limit': max_rows + 1}).mappings().all()
+    if len(runs) > max_rows or len(observations) > max_rows:
+        raise RuntimeError('Crisis observation evidence exceeds bounded read')
+    if not runs:
+        return {'capture_status': 'not_recorded', 'capture_runs': [],
+                'observations': [], 'complete': False}
+    complete = all(row['capture_status'] == 'complete_inventory_snapshot' for row in runs)
+    return {'capture_status': 'complete_inventory_snapshot' if complete else 'partial_recorded_capture',
+            'capture_runs': [dict(row) for row in runs],
+            'observations': [dict(row) for row in observations], 'complete': bool(complete)}
