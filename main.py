@@ -2392,6 +2392,57 @@ def ncm_current_crisis_attention(
     return True, False
 
 
+def ncm_current_emergency_projection(
+    site: Dict[str, Any], crises: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """M2-01: derived CURRENT attention, not a mutation of stored FHC.
+
+    SOS is independent and remains red until its own event resolution.
+    Orange is an occupied Site awaiting qualified response to any matching
+    active crisis. Green requires a fresh recorded FHC in all matching
+    active windows. With no qualified current attention we return neutral,
+    even when the last recorded Site event was FHC.
+
+    Current radius never establishes historical crisis-Site affiliation.
+    """
+    in_radius, response_pending = ncm_current_crisis_attention(site, crises)
+    if bool(site.get("sos_active")):
+        attention = "sos_active"
+    elif response_pending:
+        attention = "awaiting_signal"
+    elif in_radius and bool(site.get("full_headcount_confirmed")):
+        # A zero-occupancy Site may still submit a valid headcount response.
+        # It must be fresh for EVERY intersecting active crisis window.
+        fhc_at = ncm_crisis_attention_clock(site.get("last_full_headcount_at"))
+        now = datetime.now(timezone.utc)
+        matched = [
+            crisis for crisis in crises
+            if crisis.get("status") == "active"
+            and site_in_any_active_crisis(site, [crisis])
+        ]
+        fresh = fhc_at is not None and fhc_at <= now and bool(matched)
+        if fresh:
+            for crisis in matched:
+                opened_at = ncm_crisis_attention_clock(crisis.get("created_at"))
+                if opened_at is None or opened_at > now or fhc_at <= opened_at:
+                    fresh = False
+                    break
+        attention = "fhc_confirmed" if fresh else "none"
+    else:
+        attention = "none"
+
+    return {
+        "in_active_crisis_area": in_radius,
+        "current_emergency_attention": attention,
+        "ncm_state": {
+            "sos_active": "red",
+            "awaiting_signal": "orange",
+            "fhc_confirmed": "green",
+        }.get(attention),
+    }
+
+
+
 # =========================================================
 # H&I - Authoritative Domain Helpers (HI.1 + HI.2)
 # =========================================================
@@ -10013,12 +10064,11 @@ async def admin_list_sites():
         for site in rows:
             normalise_site_display_policy_fields(site)
 
-            site[
-                "in_active_crisis_area"
-            ] = site_in_any_active_crisis(
-                site,
-                crises,
-            )
+            # M2-01: add a derived current-attention contract; retain the
+            # original full_headcount_confirmed and Site report evidence.
+            projection = ncm_current_emergency_projection(site, crises)
+            site["in_active_crisis_area"] = projection["in_active_crisis_area"]
+            site["current_emergency_attention"] = projection["current_emergency_attention"]
 
             results.append(site)
 
@@ -13191,37 +13241,15 @@ async def ncm_sites():
         )
 
         for site in rows:
-            in_crisis_area, crisis_attention = (
-                ncm_current_crisis_attention(site, crises)
-            )
-
-            ncm_state = None
-            priority = None
-
-            if site.get(
-                "sos_active"
-            ):
-                ncm_state = "red"
-                priority = 1
-
-            elif crisis_attention:
-                ncm_state = "orange"
-                priority = 2
-
-            elif site.get(
-                "full_headcount_confirmed"
-            ):
-                ncm_state = "green"
-                priority = 3
+            projection = ncm_current_emergency_projection(site, crises)
+            in_crisis_area = projection["in_active_crisis_area"]
+            ncm_state = projection["ncm_state"]
+            priority = {"red": 1, "orange": 2, "green": 3}.get(ncm_state)
 
             if ncm_state:
-                site[
-                    "ncm_state"
-                ] = ncm_state
-
-                site[
-                    "priority"
-                ] = priority
+                site["ncm_state"] = ncm_state
+                site["current_emergency_attention"] = projection["current_emergency_attention"]
+                site["priority"] = priority
 
                 site[
                     "in_active_crisis_area"
@@ -13313,24 +13341,13 @@ async def kiosk_bootstrap(
         normalise_site_display_policy_fields(site)
 
         crises = list_active_crises(conn)
-        in_crisis_area, crisis_attention = (
-            ncm_current_crisis_attention(site, crises)
-        )
+        projection = ncm_current_emergency_projection(site, crises)
+        in_crisis_area = projection["in_active_crisis_area"]
+        ncm_state = projection["ncm_state"]
 
         active_count = int(site.get("active_count") or 0)
         sos_active = bool(site.get("sos_active"))
-        fhc_confirmed = bool(
-            site.get("full_headcount_confirmed")
-        )
-
-        ncm_state = None
-
-        if sos_active:
-            ncm_state = "red"
-        elif crisis_attention:
-            ncm_state = "orange"
-        elif fhc_confirmed:
-            ncm_state = "green"
+        fhc_confirmed = bool(site.get("full_headcount_confirmed"))
 
         return {
             "bound": True,
@@ -13373,6 +13390,7 @@ async def kiosk_bootstrap(
                 ),
             },
             "ncm_state": ncm_state,
+            "current_emergency_attention": projection["current_emergency_attention"],
             "in_active_crisis_area": in_crisis_area,
         }
 
