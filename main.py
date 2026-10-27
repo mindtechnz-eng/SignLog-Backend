@@ -13815,6 +13815,39 @@ async def ncm_internal_site_as_provenance(site_id: str):
             raise HTTPException(status_code=409, detail="Site AS history exceeds bounded complete read") from exc
 
 
+# M2A Pass A: minimal Site-scoped operational AS chronology projection.
+# This route follows the existing /admin/sites read access boundary. It does
+# NOT expose the private NCM internal-key endpoint or crisis metadata.
+# Source remains the original Backend signal journal; no new rows are written.
+@app.get("/admin/sites/{site_id}/as-attention")
+async def admin_site_as_attention(site_id: str):
+    # Explicit opt-in: Site AS history shares the existing Admin read policy.
+    # It is NOT made public automatically by deploying this source.
+    if os.getenv("SIGNLOG_ADMIN_AS_SITE_READ_ENABLED", "").strip().lower() not in ("1", "true"):
+        raise HTTPException(status_code=503, detail="Site AS history read not enabled")
+    with get_db() as conn:
+        site = fetch_one(conn, "SELECT site_id FROM sites WHERE site_id=:id", {"id": site_id})
+        if site is None:
+            raise HTTPException(status_code=404, detail="Site not found")
+        try:
+            evidence = read_site_as_provenance(conn, site_id)
+        except AsProvenanceUnavailable as exc:
+            raise HTTPException(status_code=503, detail="AS source unavailable") from exc
+        except AsProvenanceOverflow as exc:
+            raise HTTPException(status_code=409, detail="AS source history exceeds complete-read bound") from exc
+        return {
+            "contract": "signlog-admin-as-site-attention.v1",
+            "site_id": site_id,
+            "complete": evidence["complete"],
+            "entries": [
+                {"site_id": item["site_id"], "signal_id": item["signal_id"],
+                 "as_recorded_at": item["as_recorded_at"],
+                 "source_basis": item["source_basis"]}
+                for item in evidence["entries"]
+            ],
+        }
+
+
 class NcmArchiveRequest(BaseModel):
     reason: str = Field(min_length=3, max_length=500)
     actor_ref: str = Field(min_length=1, max_length=120)
