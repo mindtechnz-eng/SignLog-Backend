@@ -13367,6 +13367,48 @@ async def ncm_sites():
         }
 
 
+
+# M03-CUT03T: Minimal, read-only operational SOS/FHC SOURCE projection.
+# This is NOT the protected case-history/report API and does not create
+# a new crisis or a second episode calculator. The existing NZ-NCM pure
+# interpreter pairs the original events for the monthly operational surface.
+# Public history exposure is a deliberate deployment policy decision.
+@app.get("/ncm/singular-operational-source")
+async def ncm_singular_operational_source():
+    enabled = os.environ.get("SIGNLOG_NCM_SINGULAR_OPERATIONAL_READ_ENABLED", "").lower()
+    if enabled not in ("1", "true", "yes", "on"):
+        raise HTTPException(status_code=403, detail="Operational singular source read not enabled")
+    as_of = utc_now_iso()
+    with get_db() as conn:
+        # A single bounded source snapshot. Never claim completeness when over
+        # capacity; no silent truncation or browser-derived clock substitutes.
+        source = fetch_all(conn, """
+            SELECT id, site_id, event_type, occurred_at, created_at
+            FROM events
+            WHERE event_type IN ('sos','full_headcount')
+              AND created_at <= :as_of
+            ORDER BY occurred_at ASC, id ASC
+            LIMIT 10001
+        """, {"as_of": as_of})
+    if len(source) > 10000:
+        raise HTTPException(status_code=503, detail="Operational signal source exceeds complete-history bound")
+    return {
+        "contract": "ncm-singular-operational-source.v1",
+        "as_of": as_of,
+        "history_complete": True,
+        "limit": 10000,
+        "evidence_basis": "original_backend_sos_fhc_ids_and_timestamps_only",
+        "site_signals": [{
+            "event_id": row["id"],
+            "site_id": row["site_id"],
+            "event_type": row["event_type"],
+            "occurred_at": row["occurred_at"],
+            "received_at": row["created_at"],
+        } for row in source],
+        "caveat": "Source event pairing is signal closure only; no named-crisis association or external outcome established.",
+    }
+
+
 # =========================================================
 # Kiosk Bootstrap - Appliance / Display Policy Contract
 # =========================================================
