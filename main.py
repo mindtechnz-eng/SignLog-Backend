@@ -11801,6 +11801,99 @@ async def admin_site_ai_assistant(
         }
 
 
+# =========================================================
+# Pass B - Complete Site AIA audit retrieval for Admin reports
+# =========================================================
+
+@app.get("/admin/sites/{site_id}/ai/report-history")
+async def admin_site_ai_report_history(
+    site_id: str,
+    limit: int = Query(default=100, ge=1, le=100),
+    before_generated_at: Optional[str] = Query(default=None),
+    before_id: Optional[str] = Query(default=None),
+):
+    """Read existing AIA suggestions and decisions without invoking AIA.
+
+    Stable descending (generated_at, suggestion_id) keyset. Site-bound,
+    bounded page, no generation, decision, or H&I write. Reporters must
+    traverse every page before asserting retrieved-history completeness.
+    """
+    if (before_generated_at is None) != (before_id is None):
+        raise HTTPException(status_code=400, detail="Both AIA history cursor fields are required.")
+    if before_generated_at is not None and (
+        len(before_generated_at) > 80 or not before_generated_at.strip()
+        or len(before_id or "") > 200 or not (before_id or "").strip()
+    ):
+        raise HTTPException(status_code=400, detail="Invalid AIA history cursor.")
+
+    with get_db() as conn:
+        require_aia_site(conn, site_id)
+        sql = aia3_suggestion_select_sql() + " WHERE site_id = :site_id"
+        params: Dict[str, Any] = {"site_id": site_id, "limit": limit + 1}
+        if before_generated_at is not None:
+            sql += """ AND (
+                generated_at < :before_generated_at OR
+                (generated_at = :before_generated_at AND suggestion_id < :before_id)
+            )"""
+            params["before_generated_at"] = before_generated_at
+            params["before_id"] = before_id
+        sql += " ORDER BY generated_at DESC, suggestion_id DESC LIMIT :limit"
+        rows = fetch_all(conn, sql, params)
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        items = []
+        for row in rows:
+            suggestion = aia3_suggestion_from_row(site_id, row)
+            suggestion_id = suggestion["suggestion_id"]
+            decisions = [
+                {
+                    "id": d["id"],
+                    "site_id": site_id,
+                    "suggestion_id": suggestion_id,
+                    "actor_type": d["actor_type"],
+                    "decision": d["decision"],
+                    "resulting_hi_revision": d.get("resulting_hi_revision"),
+                    "failure_detail": d.get("failure_detail"),
+                    "occurred_at": d["occurred_at"],
+                }
+                for d in fetch_aia3_suggestion_decisions(
+                    conn, site_id=site_id, suggestion_id=suggestion_id
+                )
+            ]
+            items.append({
+                "site_id": site_id,
+                "suggestion_id": suggestion_id,
+                "status": suggestion["status"],
+                "subject_code": suggestion["subject_code"],
+                "subject_custom": suggestion.get("subject_custom"),
+                "suggestion_type": suggestion.get("suggestion_type"),
+                "generated_at": suggestion["generated_at"],
+                "updated_at": suggestion.get("updated_at"),
+                "supersedes_suggestion_id": suggestion.get("supersedes_suggestion_id"),
+                "analysis_window_from": suggestion.get("analysis_window_from"),
+                "analysis_window_to": suggestion.get("analysis_window_to"),
+                "analysis_retrieved_at": suggestion.get("retrieved_at"),
+                "analysis_history_complete": suggestion["history_complete"],
+                "evidence_event_ids": suggestion["evidence_event_ids"],
+                "hi_revision_at_analysis": suggestion["hi_revision_at_analysis"],
+                "compared_hi_item_ids": suggestion["compared_hi_item_ids"],
+                "interpretation": suggestion.get("interpretation"),
+                "board_gap": suggestion.get("board_gap"),
+                "proposal": suggestion.get("proposed_hi_payload"),
+                "decisions": decisions,
+            })
+        last = items[-1] if items else None
+        return {
+            "contract_version": "site-aia-report-history.v1",
+            "site_id": site_id,
+            "items": items,
+            "has_more": has_more,
+            "next_before_generated_at": last["generated_at"] if has_more and last else None,
+            "next_before_id": last["suggestion_id"] if has_more and last else None,
+            "retrieved_at": utc_now_iso(),
+        }
+
+
 @app.get(
     "/admin/sites/{site_id}/ai/suggestions/{suggestion_id}"
 )
