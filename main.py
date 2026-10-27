@@ -29,6 +29,7 @@ from ncm_crr01a_attention import (
 from ncm_crisis_signal_journal import (
     ensure_signal_journal_schema, record_crisis_site_state, read_crisis_signal_journal,
 )
+from ncm_site_as_provenance import read_site_as_provenance, AsProvenanceUnavailable, AsProvenanceOverflow
 
 # C2-A: Backend-owned crisis/Site issued context; no Kiosk receipt inferred.
 from ncm_crr01a_contexts import ensure_crr01a_context_schema, issue_candidate_contexts, CONTRACT as NCM_CONTEXT_CONTRACT
@@ -13794,6 +13795,24 @@ def ncm_require_internal_key(
         raise HTTPException(status_code=503, detail="NZ-NCM internal evidence service not configured")
     if not x_ncm_internal_key or not secrets.compare_digest(key, x_ncm_internal_key):
         raise HTTPException(status_code=403, detail="NZ-NCM internal evidence access denied")
+
+
+# M2A-CUT01R — Internal-only site AS provenance. Never export this endpoint
+# directly to the public Admin browser; only a trusted server may request it.
+# Source journal rows stay distinct from raw Site/Kiosk events and from NCM reports.
+@app.get("/ncm/internal/sites/{site_id}/as-provenance",
+         dependencies=[Depends(ncm_require_internal_key)])
+async def ncm_internal_site_as_provenance(site_id: str):
+    with get_db() as conn:
+        site = fetch_one(conn, "SELECT site_id FROM sites WHERE site_id=:id", {"id": site_id})
+        if site is None:
+            raise HTTPException(status_code=404, detail="Site not found")
+        try:
+            return read_site_as_provenance(conn, site_id)
+        except AsProvenanceUnavailable as exc:
+            raise HTTPException(status_code=503, detail="Source AS journal unavailable") from exc
+        except AsProvenanceOverflow as exc:
+            raise HTTPException(status_code=409, detail="Site AS history exceeds bounded complete read") from exc
 
 
 class NcmArchiveRequest(BaseModel):
